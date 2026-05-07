@@ -22,6 +22,7 @@ Hermes Dream Cycle — 记忆自主整理循环
 
 import json
 import hashlib
+import os
 import re
 import sqlite3
 import time
@@ -116,9 +117,28 @@ RETENTION_FLOOR = 0.20  # 最低保留率底线 (来自 PowerMem)
 ARCHIVE_THRESHOLD_DAYS = 90  # >90天 + 低重要性 → 归档
 ARCHIVE_MIN_SCORE = 0.25     # 低于此分数才归档
 
-# Infini AI 配置 (用于 LLM 调用)
-INFINI_BASE_URL = "https://cloud.infini-ai.com/maas/coding/v1"
-INFINI_MODEL = "deepseek-v3.2"
+# LLM 配置 (支持多 provider — 通过环境变量 DREAM_LLM_PROVIDER 切换)
+# provider: infini (default) | dashscope
+LLM_PROVIDERS = {
+    "infini": {
+        "base_url": "https://cloud.infini-ai.com/maas/coding/v1",
+        "model": "deepseek-v3.2",
+        "key_config": "credentials.infini_api_key",
+        "key_env": "INFINI_API_KEY",
+        "key_file": ("/root/projects/mem0-selfhost/.env", "OPENAI_API_KEY="),
+    },
+    "dashscope": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "deepseek-v4-pro",
+        "key_config": "credentials.dashscope_api_key",
+        "key_env": "DASHSCOPE_API_KEY",
+        "key_file": None,
+    },
+}
+# 优先级: DREAM_LLM_PROVIDER env → dashscope (V4) → infini (fallback)
+_active_provider = os.environ.get("DREAM_LLM_PROVIDER", "dashscope")
+INFINI_BASE_URL = LLM_PROVIDERS[_active_provider]["base_url"]
+INFINI_MODEL = LLM_PROVIDERS[_active_provider]["model"]
 
 # 日志
 logging.basicConfig(
@@ -455,23 +475,50 @@ def batch_vector_clustering(memory_ids: list[str], max_dist: float = 0.30) -> di
 # ─── LLM 合并摘要 ────────────────────────────────────────────────────
 
 def _get_infini_api_key() -> str:
-    """读取 Infini AI API key"""
+    """读取 LLM API key — 支持多 provider"""
+    provider_cfg = LLM_PROVIDERS.get(_active_provider, {})
+    
+    # 1. 环境变量
+    env_key = provider_cfg.get("key_env", "")
+    if env_key and os.environ.get(env_key):
+        return os.environ[env_key]
+    
+    # 2. config.yaml
     try:
         import yaml
         with open("/root/.hermes/config.yaml") as f:
             config = yaml.safe_load(f)
-        key = config.get("credentials", {}).get("infini_api_key", "")
-        if key:
-            return key
-    except:
+        # 支持 dot-notation: "credentials.infini_api_key"
+        key_path = provider_cfg.get("key_config", "").split(".")
+        value = config
+        for k in key_path:
+            value = value.get(k, {}) if isinstance(value, dict) else {}
+        if isinstance(value, str) and value:
+            return value
+    except Exception:
         pass
-    try:
-        with open("/root/projects/mem0-selfhost/.env") as f:
-            for line in f:
-                if line.startswith("OPENAI_API_KEY="):
-                    return line.strip().split("=", 1)[1]
-    except:
-        pass
+    
+    # 3. key_file (特定文件)
+    key_file_cfg = provider_cfg.get("key_file")
+    if key_file_cfg:
+        filepath, prefix = key_file_cfg
+        try:
+            with open(filepath) as f:
+                for line in f:
+                    if line.startswith(prefix):
+                        return line.strip().split("=", 1)[1]
+        except Exception:
+            pass
+    
+    # 4. Fallback: 尝试所有 provider 的 key
+    for name, cfg in LLM_PROVIDERS.items():
+        if name == _active_provider:
+            continue
+        env_key = cfg.get("key_env", "")
+        if env_key and os.environ.get(env_key):
+            log.warning(f"⚠️ {_active_provider} key not found, fallback to {name}")
+            return os.environ[env_key]
+    
     return ""
 
 
