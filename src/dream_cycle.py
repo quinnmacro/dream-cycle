@@ -523,7 +523,7 @@ def _get_infini_api_key() -> str:
 
 
 def _call_infini(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str | None:
-    """调用 Infini AI API 的通用函数"""
+    """调用 LLM API 的通用函数 — 支持 DashScope (V4 Pro) 和 Infini AI"""
     api_key = _get_infini_api_key()
     if not api_key:
         return None
@@ -533,22 +533,71 @@ def _call_infini(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
-    })
-    payload_escaped = payload.replace("'", "'\"'\"'")
+    }).encode("utf-8")
     
-    import subprocess
-    cmd = f"""curl -s {INFINI_BASE_URL}/chat/completions \
-        -H "Authorization: Bearer {api_key}" \
-        -H "Content-Type: application/json" \
-        -d '{payload_escaped}' """
+    import urllib.request
+    import urllib.error
+    
+    url = f"{INFINI_BASE_URL}/chat/completions"
+    req = urllib.request.Request(url, data=payload, headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    })
     
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        resp = json.loads(result.stdout)
-        content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
         return content.strip() if content else None
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:200]
+        log.warning(f"⚠️ LLM API HTTP {e.code}: {err_body}")
+        return None
     except Exception as e:
-        log.warning(f"⚠️ Infini API 调用失败: {e}")
+        log.warning(f"⚠️ LLM API 调用失败 ({_active_provider}/{INFINI_MODEL}): {e}")
+        # Fallback: 尝试另一个 provider
+        if _active_provider != "infini":
+            infini_cfg = LLM_PROVIDERS["infini"]
+            fallback_url = infini_cfg["base_url"]
+            fallback_model = infini_cfg["model"]
+            # 用 Infini 的 key 查找逻辑
+            infini_key = ""
+            env_key = infini_cfg.get("key_env", "")
+            if env_key and os.environ.get(env_key):
+                infini_key = os.environ[env_key]
+            if not infini_key:
+                try:
+                    import yaml as _yaml
+                    with open("/root/.hermes/config.yaml") as _f:
+                        _cfg = _yaml.safe_load(_f)
+                    _kp = infini_cfg.get("key_config", "").split(".")
+                    _v = _cfg
+                    for _k in _kp:
+                        _v = _v.get(_k, {}) if isinstance(_v, dict) else {}
+                    if isinstance(_v, str):
+                        infini_key = _v
+                except Exception:
+                    pass
+            if infini_key:
+                log.info(f"  🔄 Fallback to infini/deepseek-v3.2")
+                try:
+                    payload2 = json.dumps({
+                        "model": fallback_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    }).encode("utf-8")
+                    req2 = urllib.request.Request(
+                        f"{fallback_url}/chat/completions", data=payload2, headers={
+                            "Authorization": f"Bearer {infini_key}",
+                            "Content-Type": "application/json",
+                        })
+                    with urllib.request.urlopen(req2, timeout=60) as resp2:
+                        body2 = json.loads(resp2.read().decode("utf-8"))
+                    content2 = body2.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    return content2.strip() if content2 else None
+                except Exception:
+                    pass
         return None
 
 
@@ -2812,10 +2861,9 @@ def format_report(result: dict, rem_results: dict = None, stats: dict = None) ->
 
 
 def send_telegram_report(report: str):
-    """通过 Telegram Bot 发送报告"""
+    """通过 Telegram Bot 发送报告 (HTML格式，更安全)"""
     import subprocess
-    # 用 hermes send_message 或直接 curl
-    # 从 config 读 bot token + chat_id
+    import urllib.parse
     try:
         config_path = Path("/root/.hermes/config.yaml")
         if config_path.exists():
@@ -2825,11 +2873,22 @@ def send_telegram_report(report: str):
             token = config.get("telegram", {}).get("bot_token", "")
             chat_id = config.get("telegram", {}).get("home_chat_id", "")
             if token and chat_id:
-                import urllib.parse
-                encoded = urllib.parse.quote(report, safe='')
-                url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={encoded}&parse_mode=Markdown"
-                subprocess.run(["curl", "-s", url], timeout=10, capture_output=True)
-                log.info("📱 Telegram 报告已发送")
+                # 用 HTML parse_mode 更安全（Markdown 遇到特殊字符会崩）
+                # 转换 **bold** → <b>bold</b>
+                html_report = report
+                html_report = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', html_report)
+                html_report = html_report.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                # 还原 HTML 标签
+                html_report = html_report.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
+                
+                encoded = urllib.parse.quote(html_report, safe='')
+                url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={encoded}&parse_mode=HTML"
+                result = subprocess.run(["curl", "-s", "--max-time", "10", url], 
+                                       timeout=15, capture_output=True, text=True)
+                if result.returncode == 0 and '"ok":true' in result.stdout:
+                    log.info("📱 Telegram 报告已发送")
+                else:
+                    log.warning(f"⚠️ Telegram 发送失败: {result.stdout[:200]}")
                 return
         log.warning("⚠️ Telegram 配置不完整，跳过发送")
     except Exception as e:
@@ -3102,6 +3161,183 @@ def review_vault_suggestions(max_review: int = 5) -> list[dict]:
     return reviewed
 
 
+def resolve_pending_contradictions(max_resolve: int = 50, diff_threshold: float = 0.5,
+                                    dry_run: bool = False) -> list[dict]:
+    """
+    P11: 批量处理 pending 矛盾
+    
+    策略:
+    - high_diff (>0.6): 最可能是真矛盾 → LLM判断 SUPERSEDE/EXTEND
+    - mid_diff (0.4-0.6): 多数是语义重复 → LLM判断 ADD/FALSE_POSITIVE
+    - low_diff (<0.4): 不值得LLM调用 → 标记FALSE_POSITIVE
+    
+    SUPERSEDE: 旧记忆标记 archived, 新记忆保留
+    EXTEND: 两条都保留, 关系标记EXTENDS
+    FALSE_POSITIVE: 标记后跳过
+    ADD: 两条都保留, 不冲突
+    
+    Returns: 处理结果列表
+    """
+    conn = sqlite3.connect(str(DREAM_DB))
+    
+    # 获取所有 pending 矛盾, 按diff降序
+    pending = conn.execute("""
+        SELECT id, mem1_id, mem2_id, marker, contradiction_type, llm_explanation
+        FROM contradiction_log
+        WHERE resolution = 'pending'
+        ORDER BY id
+    """).fetchall()
+    conn.close()
+    
+    if not pending:
+        print("✅ 没有 pending 矛盾")
+        return []
+    
+    print(f"📋 {len(pending)} 个 pending 矛盾, 处理前 {max_resolve} 个 (diff>{diff_threshold})")
+    
+    resolved = []
+    llm_calls = 0
+    auto_resolved = 0
+    
+    for row in pending:
+        if len(resolved) >= max_resolve:
+            break
+            
+        cid, mem1_id, mem2_id, marker, ctype, explanation = row
+        
+        # 提取 diff 值
+        diff_val = 0.5  # 默认
+        diff_match = re.search(r'diff=([\d.]+)', marker)
+        if diff_match:
+            diff_val = float(diff_match.group(1))
+        
+        # 低于阈值 → 自动 FALSE_POSITIVE
+        if diff_val < diff_threshold:
+            if not dry_run:
+                conn = sqlite3.connect(str(DREAM_DB))
+                conn.execute("UPDATE contradiction_log SET resolution = 'false_positive_auto' WHERE id = ?", (cid,))
+                conn.commit()
+                conn.close()
+            auto_resolved += 1
+            resolved.append({"id": cid, "resolution": "false_positive_auto", "diff": diff_val})
+            continue
+        
+        # 获取两条记忆的文本
+        try:
+            rows1 = pg_query(f"SELECT LEFT(payload->>'data', 300) FROM mem0 WHERE id::text = '{mem1_id}'")
+            rows2 = pg_query(f"SELECT LEFT(payload->>'data', 300) FROM mem0 WHERE id::text = '{mem2_id}'")
+            text1 = rows1[0][0] if rows1 else ""
+            text2 = rows2[0][0] if rows1 else ""
+        except Exception:
+            text1, text2 = "", ""
+        
+        if not text1 or not text2:
+            if not dry_run:
+                conn = sqlite3.connect(str(DREAM_DB))
+                conn.execute("UPDATE contradiction_log SET resolution = 'mem_deleted' WHERE id = ?", (cid,))
+                conn.commit()
+                conn.close()
+            resolved.append({"id": cid, "resolution": "mem_deleted", "diff": diff_val})
+            continue
+        
+        # LLM 判断
+        prompt = f"""判断以下两条记忆之间的关系类型。
+
+记忆A: {text1[:200]}
+记忆B: {text2[:200]}
+
+当前标记: {marker}
+
+请判断:
+1. SUPERSEDE: B是A的更新版本（A已过时/被纠正）→ 返回 SUPERSEDE + 要归档哪条(mem1/mem2)
+2. EXTEND: B补充了A的信息（两者都有效，B更详细）→ 返回 EXTEND
+3. ADD: 两条记忆只是表述不同，实际说的是同一件事（无矛盾）→ 返回 ADD
+4. FALSE_POSITIVE: 不是真正的矛盾（语义差异而非事实矛盾）→ 返回 FALSE_POSITIVE
+
+只输出一行JSON:
+{{"resolution": "SUPERSEDE|EXTEND|ADD|FALSE_POSITIVE", "archive": "mem1|mem2|null", "explanation": "一句话解释"}}"""
+
+        result = _call_infini(prompt, max_tokens=150, temperature=0.1)
+        llm_calls += 1
+        
+        resolution = "unresolved"
+        archive = None
+        llm_explanation = ""
+        
+        if result:
+            json_match = re.search(r'\{[^{}]+\}', result)
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group())
+                    resolution = parsed.get("resolution", "unresolved").upper()
+                    archive = parsed.get("archive")
+                    llm_explanation = parsed.get("explanation", "")[:200]
+                except json.JSONDecodeError:
+                    pass
+        
+        # 执行resolution
+        if resolution == "SUPERSEDE" and archive:
+            if not dry_run:
+                # 标记归档的旧记忆
+                old_id = mem1_id if archive == "mem1" else mem2_id
+                try:
+                    pg_query(f"UPDATE mem0 SET payload = payload || '{{\"archived\": true, \"superseded_by\": \"{mem2_id if archive == 'mem1' else mem1_id}\"}}' WHERE id::text = '{old_id}'")
+                except Exception:
+                    pass  # PG JSON concat 可能语法问题，不阻断
+                conn = sqlite3.connect(str(DREAM_DB))
+                conn.execute("UPDATE contradiction_log SET resolution = ?, llm_explanation = ? WHERE id = ?",
+                           (f"supersede_{archive}", llm_explanation, cid))
+                conn.commit()
+                conn.close()
+            resolved.append({"id": cid, "resolution": f"supersede_{archive}", "diff": diff_val, "explanation": llm_explanation})
+            
+        elif resolution == "EXTEND":
+            if not dry_run:
+                conn = sqlite3.connect(str(DREAM_DB))
+                conn.execute("UPDATE contradiction_log SET resolution = 'extend', llm_explanation = ? WHERE id = ?",
+                           (llm_explanation, cid))
+                conn.commit()
+                conn.close()
+            resolved.append({"id": cid, "resolution": "extend", "diff": diff_val, "explanation": llm_explanation})
+            
+        elif resolution == "ADD":
+            if not dry_run:
+                conn = sqlite3.connect(str(DREAM_DB))
+                conn.execute("UPDATE contradiction_log SET resolution = 'add', llm_explanation = ? WHERE id = ?",
+                           (llm_explanation, cid))
+                conn.commit()
+                conn.close()
+            resolved.append({"id": cid, "resolution": "add", "diff": diff_val, "explanation": llm_explanation})
+            
+        elif resolution == "FALSE_POSITIVE":
+            if not dry_run:
+                conn = sqlite3.connect(str(DREAM_DB))
+                conn.execute("UPDATE contradiction_log SET resolution = 'false_positive', llm_explanation = ? WHERE id = ?",
+                           (llm_explanation, cid))
+                conn.commit()
+                conn.close()
+            resolved.append({"id": cid, "resolution": "false_positive", "diff": diff_val, "explanation": llm_explanation})
+        else:
+            resolved.append({"id": cid, "resolution": "unresolved", "diff": diff_val})
+        
+        # 限速: 每5个暂停1秒
+        if llm_calls % 5 == 0:
+            time.sleep(1)
+    
+    # 汇总
+    counts = {}
+    for r in resolved:
+        res = r["resolution"].split("_")[0] if "_" in r["resolution"] else r["resolution"]
+        counts[res] = counts.get(res, 0) + 1
+    
+    print(f"\n📊 矛盾处理结果:")
+    print(f"  总处理: {len(resolved)} (auto: {auto_resolved}, LLM: {llm_calls})")
+    for res, count in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"  {res}: {count}")
+    
+    return resolved
+
+
 # ─── CLI ───────────────────────────────────────────────────────────────
 
 def main():
@@ -3117,6 +3353,9 @@ def main():
     parser.add_argument("--trigger-check", action="store_true", help="检查是否应该触发梦循环 (自适应触发)")
     parser.add_argument("--health", action="store_true", help="P8: 显示梦循环健康仪表盘 (7天趋势)")
     parser.add_argument("--vault-review", action="store_true", help="P9: 处理 pending vault suggestion")
+    parser.add_argument("--resolve-contradictions", action="store_true", help="P11: 批量处理 pending 矛盾")
+    parser.add_argument("--max-resolve", type=int, default=50, help="P11: 最多处理多少个矛盾")
+    parser.add_argument("--diff-threshold", type=float, default=0.5, help="P11: diff低于此值自动标false_positive")
     parser.add_argument("--auto", action="store_true", help="自适应模式: 先检查触发条件，满足才执行")
     args = parser.parse_args()
     
@@ -3162,6 +3401,15 @@ def main():
         print(f"📝 Vault Review: {len(results)} 条处理")
         for r in results:
             print(f"  {r['entity']}: {r['action']} → {r.get('status', '?')}")
+        return results
+    
+    # P11: 批量处理矛盾
+    if args.resolve_contradictions:
+        results = resolve_pending_contradictions(
+            max_resolve=args.max_resolve,
+            diff_threshold=args.diff_threshold,
+            dry_run=args.dry_run,
+        )
         return results
     
     # 自适应模式: 先检查触发条件
