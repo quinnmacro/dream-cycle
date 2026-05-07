@@ -1,0 +1,29 @@
+[project]
+name = "dream-cycle"
+version = "3.2.0"
+description = "Autonomous Memory Consolidation for AI Agents — inspired by sleep neuroscience"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Quinn Liu", email = "quinn@quinnmacro.com"},
+]
+keywords = ["ai", "memory", "consolidation", "sleep", "knowledge-graph", "neo4j", "mem0"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "neo4j>=5.0",
+]
+
+[project.scripts]
+dream-cycle = "dream_cycle:main"
+
+[project.urls]
+Homepage = "https://github.com/quinnmacro/dream-cycle"
+Documentation = "https://github.com/quinnmacro/dream-cycle#readme"
+Repository = "https://github.com/quinnmacro/dream-cycle"
