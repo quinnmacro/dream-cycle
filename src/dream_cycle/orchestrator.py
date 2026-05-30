@@ -352,6 +352,7 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
         memories, sessions, signals = prepared
         if not memories and not sessions:
             log.warning("⚠️ 没有新记忆或session, 跳过梦循环")
+            _skip_run(dream_run_id, "no_memories")
             _release_lock()
             return {"status": "skipped", "reason": "no_memories"}
 
@@ -517,7 +518,7 @@ def review_vault_suggestions(max_review: int = 5) -> list[dict]:
         sid, entity, category, freq, reason, drid = p
         
         # 检查是否已有 Vault 页面
-        slug = entity.lower().replace(" ", "-")[:50]
+        slug = entity.lower().replace(" ", "-").replace("|", "-")[:50]
         cat_map = {"markets": "markets", "investment": "markets", "projects": "projects", 
                    "technology": "concepts", "concepts": "concepts"}
         vault_cat = cat_map.get(category, "concepts")
@@ -557,7 +558,7 @@ def review_vault_suggestions(max_review: int = 5) -> list[dict]:
     # Process auto_created: 检查内容是否需要充实
     for ac in auto_created:
         sid, entity, category = ac
-        slug = entity.lower().replace(" ", "-")[:50]
+        slug = entity.lower().replace(" ", "-").replace("|", "-")[:50]
         cat_map = {"markets": "markets", "investment": "markets", "projects": "projects",
                    "technology": "concepts", "concepts": "concepts"}
         vault_cat = cat_map.get(category, "concepts")
@@ -714,7 +715,7 @@ def batch_review_all_vault(max_per_run: int = 100) -> dict:
         sid, entity, category, freq, reason = row
         
         # 检查是否已有 Vault 页面
-        slug = entity.lower().replace(" ", "-")[:50]
+        slug = entity.lower().replace(" ", "-").replace("|", "-")[:50]
         cat_map = {"markets": "markets", "investment": "markets", "projects": "projects",
                    "technology": "concepts", "concepts": "concepts"}
         vault_cat = cat_map.get(category, "concepts")

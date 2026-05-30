@@ -220,9 +220,9 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
                 rc = real_rc
                 sc = real_sc
             else:
-                # fallback: 启发式估算
-                rc = len(group)  # 同组数 ≈ 被一起召回的次数
-                sc = len(set(mem.get("created_at", "")[:10] for mem in group))  # 不同日期数
+                # No real recall hit — don't fabricate signal from cluster size
+                rc = 0
+                sc = 0
             
             s = score_importance(m, recall_count=rc, session_count=sc)
             scored.append((m, s))
@@ -377,34 +377,32 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
                 })
         
         # 整组重要性高 → Vault 候选
-        # P4: 三重门限放松 — 全通过=high_priority, 任一通过=normal_priority
-        passes_all = (best_score >= PROMOTION_MIN_SCORE 
+        # Three-gate check: score + recalls + cross-session
+        passes_all = (best_score >= PROMOTION_MIN_SCORE
                       and len(group) >= PROMOTION_MIN_RECALLS
                       and len(set(mem.get("created_at", "")[:10] for mem, _ in scored)) >= PROMOTION_MIN_SESSIONS)
-        passes_any = (best_score >= 0.5 or len(group) >= 2)
-        
-        if passes_all or passes_any:
-            # 使用 LLM 实体提取 (优先) + 规则 fallback
-            all_texts = [mem["text"] for mem, _ in scored]
-            top_keywords = extract_entities_with_fallback(all_texts, max_entities=5)
-            
-            # 时间感知选sample：优先选最新的记忆文本，避免过期市场数据进入概览
-            freshest = min(scored, key=lambda ms: _compute_memory_age_days(ms[0].get("created_at")) or 9999)
-            sample_text = freshest[0]["text"][:200]
-            sample_age = _compute_memory_age_days(freshest[0].get("created_at"))
-            
-            results["vault_candidates"].append({
-                "cluster": cluster_key,
-                "memories": [mem["id"] for mem, _ in scored],
-                "best_score": best_score,
-                "recall_count": len(group),
-                "session_count": len(set(mem.get("created_at", "")[:10] for mem, _ in scored)),
-                "keywords": top_keywords,
-                "sample_text": sample_text,
-                "sample_age_days": sample_age,
-                "promotion_pass": "all_3_gates" if passes_all else "any_gate",
-                "priority": "high" if passes_all else "normal",
-            })
+
+        # Use LLM entity extraction (preferred) + rule fallback
+        all_texts = [mem["text"] for mem, _ in scored]
+        top_keywords = extract_entities_with_fallback(all_texts, max_entities=5)
+
+        # Time-aware sample selection: prefer freshest memory text
+        freshest = min(scored, key=lambda ms: _compute_memory_age_days(ms[0].get("created_at")) or 9999)
+        sample_text = freshest[0]["text"][:200]
+        sample_age = _compute_memory_age_days(freshest[0].get("created_at"))
+
+        results["vault_candidates"].append({
+            "cluster": cluster_key,
+            "memories": [mem["id"] for mem, _ in scored],
+            "best_score": best_score,
+            "recall_count": len(group),
+            "session_count": len(set(mem.get("created_at", "")[:10] for mem, _ in scored)),
+            "keywords": top_keywords,
+            "sample_text": sample_text,
+            "sample_age_days": sample_age,
+            "promotion_pass": "all_3_gates" if passes_all else "below_gates",
+            "priority": "high" if passes_all else "normal",
+        })
     
     # ── Phase 2: LLM 验证预筛矛盾 (限10个，避免 API 过载) ──
     unverified = [c for c in results["contradictions"] if not c.get("verified", False)]

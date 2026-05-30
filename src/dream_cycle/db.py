@@ -153,11 +153,9 @@ def init_dream_db():
 
 # ─── PG 访问层 ─────────────────────────────────────────────────────────
 
-def pg_query(sql: str, params=None) -> list[dict]:
+def pg_query(sql: str) -> list[list[str]]:
     """通过 docker exec 查询 PG (stdin 管道模式, 避免 Argument list too long)"""
     import subprocess, tempfile
-    if params:
-        pass
     cmd = ['docker', 'exec', '-i', PG_CONTAINER, 'psql', '-U', PG_USER, '-d', PG_DB, '-t', '-A', '-F', '|']
     result = subprocess.run(cmd, input=sql.encode(), capture_output=True, text=False, timeout=300)
     stdout = result.stdout.decode()
