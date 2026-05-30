@@ -191,13 +191,38 @@ PROMOTION_MIN_SESSIONS = 2        # 最低跨 session 出现次数
 # 优先标记 (永不归档, 来自 Auto-Dream)
 PERMANENT_MARKERS = ['⚠️ PERMANENT', '🔥 HIGH', '📌 PIN']
 
-# 衰减参数 (Ebbinghaus, R = e^(-t/S))
+# 衰减参数 (FadeMem 双层差异化 Ebbinghaus: R = e^(-λ·t^β))
+# β>1 = super-linear fast decay (volatile), β<1 = sub-linear slow decay (stable)
 DECAY_HALF_LIVES = {
     "volatile": 3,    # 天 — 市场数据
     "normal": 7,      # 天 — 项目/工具
     "stable": 30,     # 天 — 用户/基建
 }
+FADEMEM_BETA = {
+    "volatile": 1.2,  # super-linear: 市场数据快速衰减
+    "normal": 1.0,    # linear: 标准指数衰减
+    "stable": 0.8,    # sub-linear: 用户偏好/基建慢衰减
+}
 RETENTION_FLOOR = 0.20  # 最低保留率底线 (来自 PowerMem)
+
+# Session Signal Scanning (from Anthropic autoDream / dream-skill)
+# 从 state.db 用户消息中提取高价值信号
+SIGNAL_CORRECTIONS = [
+    "不对", "错了", "actually", "wrong", "别这样", "stop doing", "不是",
+    "incorrect", "I said", "I meant", "don't do", "correction", "修改",
+]
+SIGNAL_PREFERENCES = [
+    "我喜欢", "prefer", "always use", "从今以后", "记住", "I like",
+    "I want", "going forward", "keep in mind", "make sure", "我的偏好",
+]
+SIGNAL_DECISIONS = [
+    "决定", "我们用", "let's go with", "chosen", "decision", "agreed",
+    "the plan is", "switch to", "move to", "pick", "选定", "方案是",
+]
+SIGNAL_PATTERNS = [
+    "又是", "每次", "every time", "again", "keep forgetting", "as usual",
+    "same as before", "like last time", "老问题", "反复",
+]
 
 # 归档策略 (来自 Auto-Dream: 永不删除, 归档)
 ARCHIVE_THRESHOLD_DAYS = 90  # >90天 + 低重要性 → 归档
@@ -1404,6 +1429,49 @@ def stage1_shallow_sleep(memories: list[dict]) -> dict[str, list[dict]]:
 
 # ─── Stage 2: REM (快速眼动) — 重要性评分 ────────────────────────────
 
+
+def classify_decay_tier(text: str) -> str:
+    """
+    FadeMem: 分类记忆衰减层级
+    
+    - volatile (β=1.2): 市场数据、价格、实时新闻 → 快速衰减
+    - stable (β=0.8): 用户偏好、基础设施、个人信息 → 慢衰减
+    - normal (β=1.0): 默认
+    """
+    text_lower = text.lower()
+    
+    # Volatile: market data, prices, time-sensitive
+    volatile_kw = [
+        "yield", "spread", "bp", "bps", "price", "价格", "利率", "利差",
+        "today", "yesterday", "今天", "昨天", "收盘", "开盘", "实时",
+        "breaking", "突发", "just announced", "刚发布", "非农", "GDP",
+        "CPI", "PMI", "NFP", "Fed meeting", "央行", "data release",
+        "stock", "股价", "ticker", "market close", "intraday",
+    ]
+    
+    # Stable: user preferences, infrastructure, personal info
+    stable_kw = [
+        "prefer", "偏好", "喜欢", "like", "always", "never", "from now on",
+        "server", "服务器", "config", "setup", "部署", "infrastructure",
+        "password", "key", "credential", "user_id", "api_key",
+        "my name", "I am", "我是", "my role", "我的角色", "architecture",
+        "framework", "design pattern", "convention", "standard", "规范",
+    ]
+    
+    volatile_hits = sum(1 for kw in volatile_kw if kw in text_lower)
+    stable_hits = sum(1 for kw in stable_kw if kw in text_lower)
+    
+    if volatile_hits >= 2:
+        return "volatile"
+    elif stable_hits >= 2:
+        return "stable"
+    elif volatile_hits > stable_hits:
+        return "volatile"
+    elif stable_hits > volatile_hits:
+        return "stable"
+    return "normal"
+
+
 def score_importance(memory: dict, recall_count: int = 0, session_count: int = 0) -> float:
     """
     REM: 6维重要性评分 (对齐 OpenClaw Dreaming)
@@ -1418,19 +1486,28 @@ def score_importance(memory: dict, recall_count: int = 0, session_count: int = 0
     """
     scores = {}
     
-    # Recency (Ebbinghaus: R = e^(-t/S), 14天半衰期)
+    # Recency (FadeMem dual-layer: R = e^(-λ·t^β))
+    # volatile β=1.2 (fast), stable β=0.8 (slow), normal β=1.0
     try:
         created = memory.get("created_at", "")
         if created:
             dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
             age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
-            half_life = 14  # OpenClaw 默认
-            retention = math.exp(-age_days * math.log(2) / half_life)
-            scores["recency"] = max(RETENTION_FLOOR, retention)  # 底线 20%
+            text = memory.get("text", "")
+            tier = classify_decay_tier(text)
+            half_life = DECAY_HALF_LIVES.get(tier, 7)
+            beta = FADEMEM_BETA.get(tier, 1.0)
+            # λ = ln(2) / half_life, then R = e^(-λ · t^β)
+            lam = math.log(2) / half_life
+            retention = math.exp(-lam * (age_days ** beta))
+            scores["recency"] = max(RETENTION_FLOOR, retention)
+            scores["decay_tier"] = tier  # track for reporting
         else:
             scores["recency"] = 0.5
+            scores["decay_tier"] = "normal"
     except:
         scores["recency"] = 0.5
+        scores["decay_tier"] = "normal"
     
     # Frequency (被召回次数, 来自 mem0_search 统计)
     scores["frequency"] = min(1.0, math.log2(recall_count + 1) / 4) if recall_count > 0 else 0.1
@@ -2963,6 +3040,30 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
         log.info(f"📋 近期 session: {len(sessions)} 个")
         log.info(session_digest)
         
+        # ── Session Signal Scanning (from Anthropic autoDream) ──
+        # 扫描用户消息提取纠正/偏好/决策/模式信号
+        session_signals = scan_session_signals(hours)
+        total_signals = sum(len(v) for v in session_signals.values())
+        if total_signals > 0:
+            log.info(f"📡 Session 信号: {total_signals} 条 "
+                     f"(纠正={len(session_signals['corrections'])}, "
+                     f"偏好={len(session_signals['preferences'])}, "
+                     f"决策={len(session_signals['decisions'])}, "
+                     f"模式={len(session_signals['patterns'])})")
+            # 将信号注入为高优先级记忆候选 (加入 memories 列表)
+            for sig_type, sigs in session_signals.items():
+                for sig in sigs[:5]:  # 每类最多5条
+                    memories.append({
+                        "id": f"signal_{sig_type}_{sig['timestamp']:.0f}",
+                        "text": f"[SESSION_{sig_type.upper()}] {sig['text']}",
+                        "created_at": datetime.fromtimestamp(sig['timestamp'], tz=timezone.utc).isoformat(),
+                        "source": "session_signal",
+                        "signal_type": sig_type,
+                        "session_title": sig.get("session_title", ""),
+                    })
+        else:
+            log.info("📡 Session 信号: 0 条")
+        
         if not memories and not sessions:
             log.warning("⚠️ 没有新记忆或session, 跳过梦循环")
             _release_lock()
@@ -3340,6 +3441,101 @@ def mine_recent_sessions(hours: int = 24) -> list[dict]:
             })
     
     return topics
+
+
+
+def scan_session_signals(hours: int = 72) -> dict:
+    """
+    Session Transcript Scanning (from Anthropic autoDream / dream-skill).
+    
+    Scan state.db user messages for 4 signal types:
+    - corrections: user corrected the agent (highest priority)
+    - preferences: explicit preference statements
+    - decisions: architectural/tool choices
+    - patterns: recurring complaints or repeated requests
+    
+    Returns: {"corrections": [...], "preferences": [...], "decisions": [...], "patterns": [...]}
+    Each item: {"text": str, "session_id": str, "timestamp": float, "signal_type": str}
+    """
+    if not STATE_DB.exists():
+        return {"corrections": [], "preferences": [], "decisions": [], "patterns": []}
+    
+    cutoff = time.time() - hours * 3600
+    signals = {"corrections": [], "preferences": [], "decisions": [], "patterns": []}
+    
+    try:
+        conn = sqlite3.connect(str(STATE_DB))
+        cursor = conn.execute("""
+            SELECT m.content, m.session_id, m.timestamp, s.title
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            WHERE m.role = 'user'
+            AND m.timestamp > ?
+            AND m.content IS NOT NULL
+            AND length(m.content) > 10
+            AND length(m.content) < 500
+            AND m.content NOT LIKE '[IMPORTANT%'
+            AND m.content NOT LIKE 'Tool results%'
+            AND m.content NOT LIKE '%SYSTEM:%'
+            ORDER BY m.timestamp DESC
+            LIMIT 2000
+        """, (cutoff,))
+        
+        for row in cursor:
+            text, session_id, ts, title = row
+            text_stripped = text.strip()
+            text_lower = text_stripped.lower()
+            
+            # Skip very short or system-like messages
+            if len(text_stripped) < 15:
+                continue
+            
+            # Check each signal type (priority order)
+            matched_type = None
+            matched_kw = None
+            
+            for kw in SIGNAL_CORRECTIONS:
+                if kw.lower() in text_lower:
+                    matched_type = "corrections"
+                    matched_kw = kw
+                    break
+            
+            if not matched_type:
+                for kw in SIGNAL_PREFERENCES:
+                    if kw.lower() in text_lower:
+                        matched_type = "preferences"
+                        matched_kw = kw
+                        break
+            
+            if not matched_type:
+                for kw in SIGNAL_DECISIONS:
+                    if kw.lower() in text_lower:
+                        matched_type = "decisions"
+                        matched_kw = kw
+                        break
+            
+            if not matched_type:
+                for kw in SIGNAL_PATTERNS:
+                    if kw.lower() in text_lower:
+                        matched_type = "patterns"
+                        matched_kw = kw
+                        break
+            
+            if matched_type:
+                signals[matched_type].append({
+                    "text": text_stripped[:300],
+                    "session_id": session_id,
+                    "session_title": title or "untitled",
+                    "timestamp": ts,
+                    "signal_type": matched_type,
+                    "trigger_keyword": matched_kw,
+                })
+        
+        conn.close()
+    except Exception as e:
+        log.warning(f"⚠️ session signal scan failed: {e}")
+    
+    return signals
 
 
 def generate_session_digest(sessions: list[dict]) -> str:
