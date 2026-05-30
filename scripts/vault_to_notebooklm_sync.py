@@ -25,7 +25,7 @@ NB_PATH = "/root/.hermes/hermes-agent/venv/bin/notebooklm"
 VAULT_ROOT = Path("/root/vault")
 SYNC_STATE = Path("/root/.notebooklm/vault_sync_state.json")
 SUPPORTED_EXT = {".md", ".pdf", ".txt", ".docx"}
-SKIP_PATTERN = re.compile(r'^(archive|backup|old|_|status|inbox)', re.IGNORECASE)
+SKIP_PATTERN = re.compile(r'^(archive|backup|old|_|status|inbox|nlm-|notebooklm-)', re.IGNORECASE)
 
 # Category → Notebook title mapping
 CATEGORY_MAP = {
@@ -58,14 +58,14 @@ def run_nb_json(args: list[str], timeout: int = 180) -> dict | None:
         # Check for auth errors in JSON response
         if data.get("error") and "Authentication expired" in str(data.get("message", "")):
             print("❌ NotebookLM auth expired. Aborting sync to prevent duplicate creation.")
-            print("   Run: python3 /root/scripts/refresh_notebooklm_cookies.py")
+            print("   Run: python3 /root/scripts/notebooklm/refresh_notebooklm_cookies.py")
             return None
         return data
     except json.JSONDecodeError:
         # Fallback: check stdout for non-JSON auth errors
         if "Authentication expired" in result.stdout or "sign in" in result.stdout.lower():
             print("❌ NotebookLM auth expired. Aborting sync to prevent duplicate creation.")
-            print("   Run: python3 /root/scripts/refresh_notebooklm_cookies.py")
+            print("   Run: python3 /root/scripts/notebooklm/refresh_notebooklm_cookies.py")
             return None
         return None
 
@@ -124,19 +124,22 @@ def find_matching_notebook(category: str, notebooks: dict, dry_run: bool = False
     return None
 
 
-def get_existing_sources(nb_id: str) -> set[str]:
-    """Get set of source titles already in notebook using --json (full titles, no truncation)."""
+def get_existing_sources(nb_id: str) -> dict[str, str]:
+    """Get dict of source title → source ID already in notebook using --json."""
     run_nb(["use", nb_id])
     data = run_nb_json(["source", "list"])
     if data is None:
-        return set()
+        return {}
 
-    titles = set()
+    sources = {}
     for src in data.get("sources", []):
         title = src.get("title", "").strip()
-        if title:
-            titles.add(title)
-    return titles
+        src_id = src.get("id", "").strip()
+        if title and src_id:
+            # Keep only the first source per title (for dedup)
+            if title not in sources:
+                sources[title] = src_id
+    return sources
 
 
 def sync_category(category: str, state: dict, dry_run: bool = False, force: bool = False) -> int:
@@ -169,7 +172,26 @@ def sync_category(category: str, state: dict, dry_run: bool = False, force: bool
         # Check if already synced (use relative path as key)
         rel_path = str(f.relative_to(VAULT_ROOT))
         if not force and rel_path in state["synced_files"]:
-            continue
+            # Check if file content has changed since last sync
+            last_sync_time = state["synced_files"][rel_path].get("time")
+            file_mtime = datetime.fromtimestamp(f.stat().st_mtime)
+            if last_sync_time and file_mtime > datetime.fromisoformat(last_sync_time):
+                # File has been modified — need to re-import
+                base_name = f.stem
+                full_name = f.name
+                # Delete old source from NLM then re-import
+                old_src_id = existing_sources.get(full_name) or existing_sources.get(base_name)
+                if old_src_id:
+                    print(f"  🔄 Re-importing modified: {f.name} (changed since {last_sync_time[:10]})")
+                    run_nb(["source", "delete", old_src_id, "-n", nb_id, "-y"], timeout=30)
+                    # Remove from existing_sources so it gets re-imported below
+                    for key in [full_name, base_name]:
+                        if key in existing_sources:
+                            del existing_sources[key]
+                # Remove from synced_files so it doesn't skip
+                del state["synced_files"][rel_path]
+            else:
+                continue  # Already synced and unchanged
 
         # 时间感知：检查 frontmatter 的 data_freshness 字段
         # stale 数据不推送到 NotebookLM（避免过期市场数据污染 audio overview）
@@ -180,7 +202,8 @@ def sync_category(category: str, state: dict, dry_run: bool = False, force: bool
                 end = head.find('---', 3)
                 if end > 0:
                     fm = head[3:end]
-                    # 检查 data_freshness
+                    # 检查 data_freshness — 只跳过 stale，其他值(fresh/recent/as-of-*)正常导入
+                    is_stale = False
                     for line in fm.split('\n'):
                         if line.strip().startswith('data_freshness:'):
                             freshness = line.split(':', 1)[1].strip().strip('"').strip("'")
@@ -190,10 +213,11 @@ def sync_category(category: str, state: dict, dry_run: bool = False, force: bool
                                     "status": "skipped_stale",
                                     "time": datetime.now().isoformat()
                                 }
-                                break
-                    else:
-                        continue  # frontmatter 没有 data_freshness 字段，正常导入
-                    continue  # stale 已跳过
+                                is_stale = True
+                                break  # 跳出for循环
+                            # non-stale freshness → 继续正常导入，不跳过
+                    if is_stale:
+                        continue  # stale 已跳过，处理下一个文件
         except Exception:
             pass  # 读取失败不阻断
 

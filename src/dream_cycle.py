@@ -15,14 +15,13 @@ Hermes Dream Cycle — 记忆自主整理循环
   - Supermemory: 时序感知事实更新
 
 运行时间: off-peak (03:00-05:00 HKT), 在 backup 之后
-模型: deepseek-v3.2 (Infini AI, 共享配额但凌晨几乎无竞争)
+模型: qwen3.7-max (DashScope, 凌晨独立配额)
 数据源: mem0 v2 PG (直连) + Neo4j Playground + state.db
 写回目标: PG(去重/merge) + Neo4j(关系推断) + Vault(建议) + Telegram(报告)
 """
 
 import json
 import hashlib
-import os
 import re
 import sqlite3
 import time
@@ -40,7 +39,7 @@ from collections import defaultdict
 HKT = timezone(timedelta(hours=8))
 
 # PG 连接 (通过 docker exec)
-PG_CONTAINER = "mem0-postgres"
+PG_CONTAINER = "postgres"
 PG_USER = "postgres"
 PG_DB = "mem0_v2"
 
@@ -49,8 +48,90 @@ NEO4J_URI = "bolt://100.69.76.69:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASS = "knowledge2026"
 
+# 并发锁文件
+DREAM_LOCK = Path("/tmp/dream_cycle.lock")
+DREAM_LOCK_TIMEOUT = 3600  # 1小时超时（正常跑完约15-25分钟）
+
+def safe_float(val, default=None) -> float | None:
+    """安全 float 转换 — PG 返回空字符串时不崩溃"""
+    if val is None or val == '':
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 # state.db
 STATE_DB = Path("/root/.hermes/state.db")
+
+# ─── P2-1: 真实 recall 统计 ─────────────────────────────────────────────
+
+_recall_stats_cache: dict | None = None
+
+def get_recall_stats() -> dict[str, int]:
+    """
+    从 state.db 解析 mem0_search tool_calls，构建查询词 → 调用次数映射
+    
+    缓存结果（每次 dream cycle 只读一次 state.db）
+    Returns: {"query_text": count, ...}
+    """
+    global _recall_stats_cache
+    if _recall_stats_cache is not None:
+        return _recall_stats_cache
+    
+    stats: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(str(STATE_DB))
+        cursor = conn.execute("""
+            SELECT tool_calls FROM messages 
+            WHERE tool_calls IS NOT NULL AND tool_calls != '[]'
+        """)
+        for row in cursor:
+            try:
+                tc = json.loads(row[0])
+                for call in tc:
+                    fn = call.get("function", {}).get("name", "")
+                    if fn in ("mem0_search", "mem0_profile"):
+                        args = call.get("function", {}).get("arguments", "{}")
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                        query = args.get("query", "").strip()
+                        if query and len(query) > 3:
+                            stats[query] = stats.get(query, 0) + 1
+            except:
+                continue
+        conn.close()
+    except Exception as e:
+        log.warning(f"⚠️ recall stats 读取失败: {e}")
+    
+    _recall_stats_cache = stats
+    log.info(f"📊 recall stats: {len(stats)} unique queries, {sum(stats.values())} total calls")
+    return stats
+
+
+def match_memory_to_queries(memory_text: str, query_stats: dict[str, int]) -> tuple[int, int]:
+    """
+    将一条记忆的文本与搜索查询匹配
+    
+    Returns: (recall_count, session_count)
+    - recall_count: 有多少次搜索命中了这条记忆
+    - session_count: 有多少个不同查询命中（代理 session diversity）
+    """
+    text_lower = memory_text.lower()
+    recall_count = 0
+    matched_queries = set()
+    
+    for query, count in query_stats.items():
+        # 查询词至少 50% 的关键词出现在记忆文本中
+        query_words = [w for w in query.lower().split() if len(w) > 2]
+        if not query_words:
+            continue
+        matched_words = sum(1 for w in query_words if w in text_lower)
+        if matched_words / len(query_words) >= 0.5:
+            recall_count += count
+            matched_queries.add(query)
+    
+    return recall_count, len(matched_queries)
 
 # Vault
 VAULT_DIR = Path("/root/vault")
@@ -117,28 +198,9 @@ RETENTION_FLOOR = 0.20  # 最低保留率底线 (来自 PowerMem)
 ARCHIVE_THRESHOLD_DAYS = 90  # >90天 + 低重要性 → 归档
 ARCHIVE_MIN_SCORE = 0.25     # 低于此分数才归档
 
-# LLM 配置 (支持多 provider — 通过环境变量 DREAM_LLM_PROVIDER 切换)
-# provider: infini (default) | dashscope
-LLM_PROVIDERS = {
-    "infini": {
-        "base_url": "https://cloud.infini-ai.com/maas/coding/v1",
-        "model": "deepseek-v3.2",
-        "key_config": "credentials.infini_api_key",
-        "key_env": "INFINI_API_KEY",
-        "key_file": ("/root/projects/mem0-selfhost/.env", "OPENAI_API_KEY="),
-    },
-    "dashscope": {
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": "deepseek-v4-pro",
-        "key_config": "credentials.dashscope_api_key",
-        "key_env": "DASHSCOPE_API_KEY",
-        "key_file": None,
-    },
-}
-# 优先级: DREAM_LLM_PROVIDER env → dashscope (V4) → infini (fallback)
-_active_provider = os.environ.get("DREAM_LLM_PROVIDER", "dashscope")
-INFINI_BASE_URL = LLM_PROVIDERS[_active_provider]["base_url"]
-INFINI_MODEL = LLM_PROVIDERS[_active_provider]["model"]
+# DashScope 配置 (用于 LLM 调用)
+INFINI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+INFINI_MODEL = "qwen3.7-max"
 
 # 日志
 logging.basicConfig(
@@ -232,18 +294,18 @@ def init_dream_db():
 # ─── PG 访问层 ─────────────────────────────────────────────────────────
 
 def pg_query(sql: str, params=None) -> list[dict]:
-    """通过 docker exec 查询 PG"""
-    import subprocess
+    """通过 docker exec 查询 PG (stdin 管道模式, 避免 Argument list too long)"""
+    import subprocess, tempfile
     if params:
-        # 参数化查询不方便通过 docker exec，用安全拼接
         pass
-    cmd = f'docker exec {PG_CONTAINER} psql -U {PG_USER} -d {PG_DB} -t -A -F "|" -c "{sql}"'
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    cmd = ['docker', 'exec', '-i', PG_CONTAINER, 'psql', '-U', PG_USER, '-d', PG_DB, '-t', '-A', '-F', '|']
+    result = subprocess.run(cmd, input=sql.encode(), capture_output=True, text=False, timeout=300)
+    stdout = result.stdout.decode()
     if result.returncode != 0:
-        log.error(f"PG query failed: {result.stderr[:200]}")
+        log.error(f"PG query failed: {result.stderr.decode()[:200]}")
         return []
     rows = []
-    for line in result.stdout.strip().split("\n"):
+    for line in stdout.strip().split("\n"):
         if not line:
             continue
         parts = line.split("|")
@@ -430,10 +492,13 @@ def get_vector_neighbors(memory_id: str, limit: int = 10, max_dist: float = 0.30
     neighbors = []
     for r in rows:
         if len(r) >= 3 and r[1]:
+            dist = safe_float(r[2])
+            if dist is None:
+                continue
             neighbors.append({
                 "id": r[0],
                 "text": r[1],
-                "distance": float(r[2]),
+                "distance": dist,
             })
     return neighbors
 
@@ -465,7 +530,10 @@ def batch_vector_clustering(memory_ids: list[str], max_dist: float = 0.30) -> di
     graph: dict[str, set[str]] = defaultdict(set)
     for r in rows:
         if len(r) >= 3:
-            src, nbr, dist = r[0], r[1], float(r[2])
+            dist = safe_float(r[2])
+            if dist is None:
+                continue
+            src, nbr = r[0], r[1]
             graph[src].add(nbr)
             graph[nbr].add(src)
     
@@ -475,55 +543,33 @@ def batch_vector_clustering(memory_ids: list[str], max_dist: float = 0.30) -> di
 # ─── LLM 合并摘要 ────────────────────────────────────────────────────
 
 def _get_infini_api_key() -> str:
-    """读取 LLM API key — 支持多 provider"""
-    provider_cfg = LLM_PROVIDERS.get(_active_provider, {})
-    
-    # 1. 环境变量
-    env_key = provider_cfg.get("key_env", "")
-    if env_key and os.environ.get(env_key):
-        return os.environ[env_key]
-    
-    # 2. config.yaml
+    """读取 DashScope API key (优先) → Infini AI (fallback)"""
     try:
         import yaml
         with open("/root/.hermes/config.yaml") as f:
             config = yaml.safe_load(f)
-        # 支持 dot-notation: "credentials.infini_api_key"
-        key_path = provider_cfg.get("key_config", "").split(".")
-        value = config
-        for k in key_path:
-            value = value.get(k, {}) if isinstance(value, dict) else {}
-        if isinstance(value, str) and value:
-            return value
-    except Exception:
+        # 优先 DashScope
+        key = config.get("credentials", {}).get("dashscope_api_key", "")
+        if key:
+            return key
+        # fallback Infini
+        key = config.get("credentials", {}).get("infini_api_key", "")
+        if key:
+            return key
+    except:
         pass
-    
-    # 3. key_file (特定文件)
-    key_file_cfg = provider_cfg.get("key_file")
-    if key_file_cfg:
-        filepath, prefix = key_file_cfg
-        try:
-            with open(filepath) as f:
-                for line in f:
-                    if line.startswith(prefix):
-                        return line.strip().split("=", 1)[1]
-        except Exception:
-            pass
-    
-    # 4. Fallback: 尝试所有 provider 的 key
-    for name, cfg in LLM_PROVIDERS.items():
-        if name == _active_provider:
-            continue
-        env_key = cfg.get("key_env", "")
-        if env_key and os.environ.get(env_key):
-            log.warning(f"⚠️ {_active_provider} key not found, fallback to {name}")
-            return os.environ[env_key]
-    
+    try:
+        with open("/root/projects/mem0-selfhost/.env") as f:
+            for line in f:
+                if line.startswith("OPENAI_API_KEY="):
+                    return line.strip().split("=", 1)[1]
+    except:
+        pass
     return ""
 
 
 def _call_infini(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str | None:
-    """调用 LLM API 的通用函数 — 支持 DashScope (V4 Pro) 和 Infini AI"""
+    """调用 DashScope API (qwen3.7-max) 的通用函数"""
     api_key = _get_infini_api_key()
     if not api_key:
         return None
@@ -533,71 +579,24 @@ def _call_infini(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
-    }).encode("utf-8")
-    
-    import urllib.request
-    import urllib.error
-    
-    url = f"{INFINI_BASE_URL}/chat/completions"
-    req = urllib.request.Request(url, data=payload, headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "enable_thinking": False,  # 不需要推理，节省 tokens 和延迟
     })
     
+    import subprocess
+    auth_header = "Authorization: Bearer " + api_key
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+        result = subprocess.run(
+            ["curl", "-s", INFINI_BASE_URL + "/chat/completions",
+             "-H", auth_header,
+             "-H", "Content-Type: application/json",
+             "-d", payload],
+            capture_output=True, text=True, timeout=60,
+        )
+        resp = json.loads(result.stdout)
+        content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
         return content.strip() if content else None
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:200]
-        log.warning(f"⚠️ LLM API HTTP {e.code}: {err_body}")
-        return None
     except Exception as e:
-        log.warning(f"⚠️ LLM API 调用失败 ({_active_provider}/{INFINI_MODEL}): {e}")
-        # Fallback: 尝试另一个 provider
-        if _active_provider != "infini":
-            infini_cfg = LLM_PROVIDERS["infini"]
-            fallback_url = infini_cfg["base_url"]
-            fallback_model = infini_cfg["model"]
-            # 用 Infini 的 key 查找逻辑
-            infini_key = ""
-            env_key = infini_cfg.get("key_env", "")
-            if env_key and os.environ.get(env_key):
-                infini_key = os.environ[env_key]
-            if not infini_key:
-                try:
-                    import yaml as _yaml
-                    with open("/root/.hermes/config.yaml") as _f:
-                        _cfg = _yaml.safe_load(_f)
-                    _kp = infini_cfg.get("key_config", "").split(".")
-                    _v = _cfg
-                    for _k in _kp:
-                        _v = _v.get(_k, {}) if isinstance(_v, dict) else {}
-                    if isinstance(_v, str):
-                        infini_key = _v
-                except Exception:
-                    pass
-            if infini_key:
-                log.info(f"  🔄 Fallback to infini/deepseek-v3.2")
-                try:
-                    payload2 = json.dumps({
-                        "model": fallback_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                    }).encode("utf-8")
-                    req2 = urllib.request.Request(
-                        f"{fallback_url}/chat/completions", data=payload2, headers={
-                            "Authorization": f"Bearer {infini_key}",
-                            "Content-Type": "application/json",
-                        })
-                    with urllib.request.urlopen(req2, timeout=60) as resp2:
-                        body2 = json.loads(resp2.read().decode("utf-8"))
-                    content2 = body2.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    return content2.strip() if content2 else None
-                except Exception:
-                    pass
+        log.warning(f"⚠️ Infini API 调用失败: {e}")
         return None
 
 
@@ -605,7 +604,7 @@ def llm_merge_memories(texts: list[str]) -> str | None:
     """
     用 LLM 将多条近似记忆合并为一条
     
-    使用 deepseek-v3.2 (Infini AI), 凌晨几乎无 429
+    使用 qwen3.7-max (DashScope), 独立配额不受 Hermes 影响
     """
     numbered = "\n".join(f"{i+1}. {t[:300]}" for i, t in enumerate(texts))
     prompt = f"""将以下{len(texts)}条相关记忆合并为1条精炼记忆。保留所有关键事实，去除重复，保持时间线。
@@ -1914,66 +1913,84 @@ def nrem_hebbian_consolidation() -> dict:
 
 def detect_slot_conflicts() -> list[dict]:
     """
-    语义签名冲突检测: 发现"同一个实体/属性被赋予不同值"的情况
-    
-    来自 SleepGate:
-    - 语义签名: embedding 向量标识"什么槽位"
-    - 冲突检测: 同一语义签名下的不同值
-    
-    实现:
-    1. 从 PG 取近期记忆的 embedding
-    2. 用 pgvector 找距离很近但文本不同的对
-    3. 这些对可能是"同实体不同描述" — 用 LLM 验证是否冲突
+    语义签名冲突检测: 用 HNSW 索引逐条查找最近邻, 避免全表 cross-join
     
     Returns: [{"mem1": ..., "mem2": ..., "slot_similarity": ..., "value_diff": ...}]
     """
     conflicts = []
     
-    # 找近期记忆中语义相似但文本差异大的对
-    # pgvector 距离 <0.15 但文本相似度 <0.5 → "同槽不同值"
-    rows = pg_query("""
-        SELECT a.id::text, LEFT(a.payload->>'data', 300) as t1,
-               b.id::text, LEFT(b.payload->>'data', 300) as t2,
-               ROUND((a.vector <=> b.vector)::numeric, 4) as dist
-        FROM mem0 a, mem0 b
-        WHERE a.id < b.id
-        AND (a.vector <=> b.vector) < 0.15
-        AND a.payload->>'archived' IS NULL
-        AND b.payload->>'archived' IS NULL
-        AND LENGTH(a.payload->>'data') > 30
-        AND LENGTH(b.payload->>'data') > 30
-        ORDER BY (a.vector <=> b.vector)
-        LIMIT 20
+    # 1. 取最近 7 天有文本的记忆 ID (最多 200 条)
+    recent_ids = pg_query("""
+        SELECT id::text
+        FROM mem0
+        WHERE payload->>'archived' IS NULL
+        AND LENGTH(payload->>'data') > 30
+        AND payload->>'created_at' IS NOT NULL
+        AND payload->>'created_at' >= (NOW() - INTERVAL '7 days')::text
+        ORDER BY id
+        LIMIT 200
     """)
     
-    for r in rows:
-        if len(r) < 5 or not r[1] or not r[3]:
-            continue
-        text1, text2 = r[1], r[3]
-        vec_dist = float(r[4])
+    if not recent_ids:
+        log.info("  ✅ 无近期记忆, 跳过冲突检测")
+        return []
+    
+    # 2. 对每条记忆, 用 HNSW 索引查最近邻 (高效)
+    seen_pairs = set()
+    for row in recent_ids:
+        mem_id = row[0] if isinstance(row, list) else row
+        neighbors = get_vector_neighbors(mem_id, limit=5, max_dist=0.15)
+        for n in neighbors:
+            nid = n["id"]
+            pair_key = tuple(sorted([mem_id, nid]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            
+            # 获取两条记忆的文本
+            text_rows = pg_query(f"""
+                SELECT a.id::text, LEFT(a.payload->>'data', 300) as t1,
+                       b.id::text, LEFT(b.payload->>'data', 300) as t2
+                FROM mem0 a, mem0 b
+                WHERE a.id::text = '{mem_id}' AND b.id::text = '{nid}'
+            """)
+            
+            if not text_rows or len(text_rows[0]) < 4:
+                continue
+            r = text_rows[0]
+            text1, text2 = r[1], r[3]
+            if not text1 or not text2:
+                continue
+            
+            text_sim = combined_similarity(text1, text2)
+            vec_dist = n["distance"]
+            
+            if text_sim < 0.5:  # 语义近但文本差异大 = 槽位冲突
+                conflicts.append({
+                    "mem1_id": mem_id,
+                    "mem1_text": text1,
+                    "mem2_id": nid,
+                    "mem2_text": text2,
+                    "slot_similarity": 1.0 - vec_dist,
+                    "value_diff": 1.0 - text_sim,
+                    "type": "slot_conflict",
+                })
+                
+                if len(conflicts) >= 10:
+                    break
         
-        # 检查文本差异度 — 高向量相似但低文本相似 = 槽位冲突
-        text_sim = combined_similarity(text1, text2)
-        
-        if text_sim < 0.5:  # 语义近但文本差异大
-            conflicts.append({
-                "mem1_id": r[0],
-                "mem1_text": text1,
-                "mem2_id": r[2],
-                "mem2_text": text2,
-                "slot_similarity": 1.0 - vec_dist,  # 高 = 同槽
-                "value_diff": 1.0 - text_sim,       # 高 = 不同值
-                "type": "slot_conflict",
-            })
+        if len(conflicts) >= 10:
+            break
     
     if conflicts:
         log.info(f"  🔍 语义签名冲突: {len(conflicts)} 对'同槽不同值'")
         for c in conflicts[:3]:
             log.info(f"    [{c['slot_similarity']:.2f}槽似, {c['value_diff']:.2f}值差] "
                      f"{c['mem1_text'][:60]}... vs {c['mem2_text'][:60]}...")
+    else:
+        log.info("  ✅ 无语义签名冲突")
     
     return conflicts
-
 
 def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) -> dict:
     """
@@ -1996,23 +2013,57 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
         "contradictions": [],    # 矛盾事实对
     }
     
+    # P2-1: 加载真实 recall 统计
+    recall_stats = get_recall_stats()
+    
     for cluster_key, group in clusters.items():
-        # 评分 (TODO: recall_count/session_count 从 mem0_search 统计, 暂时用启发式)
+        # 评分: 优先用真实 recall 统计, fallback 到启发式
         scored = []
         for m in group:
-            # 启发式估算: 同组大小作为 recall proxy, 跨天创建作为 session proxy
-            rc = len(group)  # 同组数 ≈ 被一起召回的次数
-            sc = len(set(mem.get("created_at", "")[:10] for mem in group))  # 不同日期数
+            # P2-1: 真实 recall 匹配
+            real_rc, real_sc = match_memory_to_queries(m.get("text", ""), recall_stats)
+            
+            if real_rc > 0:
+                # 有真实搜索命中 → 用真实数据
+                rc = real_rc
+                sc = real_sc
+            else:
+                # fallback: 启发式估算
+                rc = len(group)  # 同组数 ≈ 被一起召回的次数
+                sc = len(set(mem.get("created_at", "")[:10] for mem in group))  # 不同日期数
+            
             s = score_importance(m, recall_count=rc, session_count=sc)
             scored.append((m, s))
         scored.sort(key=lambda x: x[1], reverse=True)
         
         # 矛盾检测 (两阶段: 关键词预筛 + LLM 验证)
         # Phase 1: 关键词预筛 — 只匹配中文高置信矛盾（收紧英文模式）
+        # P2-3: 加主题重叠过滤 — 两条记忆必须共享关键实体才视为矛盾候选
         CONTRADICTION_MARKERS = [
             ("并非", "而是"), ("不再", "改为"), ("已从", "变为"),
             ("已从", "迁到"), ("不再是", "现在是"),
         ]
+        
+        def _extract_key_nouns(text: str) -> set[str]:
+            """提取文本中的关键名词/实体（简易版）"""
+            import re
+            # 英文: 大写开头的词 + 全大写的缩写
+            en_nouns = set(re.findall(r'\b[A-Z][a-z]{2,}\b|\b[A-Z]{2,}\b', text))
+            # 中文: 提取2-4字的中文词组（粗粒度实体）
+            cn_nouns = set(re.findall(r'[\u4e00-\u9fff]{2,4}', text))
+            # 过滤常见停用词
+            stop = {'The', 'This', 'That', 'What', 'How', 'When', 'Where', 'Which',
+                    '可以', '但是', '因为', '所以', '如果', '已经', '不是', '而是',
+                    '通过', '使用', '进行', '需要', '目前', '现在', '之前', '之后'}
+            return (en_nouns | cn_nouns) - stop
+        
+        def _has_subject_overlap(text1: str, text2: str, min_overlap: int = 1) -> bool:
+            """检查两条记忆是否共享关键实体（主题重叠）"""
+            nouns1 = _extract_key_nouns(text1)
+            nouns2 = _extract_key_nouns(text2)
+            overlap = nouns1 & nouns2
+            return len(overlap) >= min_overlap
+        
         if len(group) >= 2:
             texts = [m["text"] for m, _ in scored]
             texts_lower = [t.lower() for t in texts]
@@ -2028,7 +2079,8 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
                             elif marker_pair[1] in t1 and marker_pair[0] in t2:
                                 matched_marker = f"{marker_pair[1]} vs {marker_pair[0]}"
                                 break
-                    if matched_marker:
+                    # P2-3: 只有主题重叠的对才标记矛盾
+                    if matched_marker and _has_subject_overlap(texts[i], texts[j]):
                         results["contradictions"].append({
                             "mem1": scored[i][0], "mem2": scored[j][0],
                             "marker": matched_marker,
@@ -2038,6 +2090,20 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
         
         if len(group) == 1:
             m, s = scored[0]
+            # P10: 年龄驱动衰减旁路 — >90天且非高重要性 → 强制衰减
+            try:
+                created = m.get("created_at", "")
+                if created:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+                    if age_days > ARCHIVE_THRESHOLD_DAYS and s < 0.50:
+                        results["decay_candidates"].append({
+                            "memory": m, "score": s,
+                            "reason": f"age_based({age_days:.0f}d>{ARCHIVE_THRESHOLD_DAYS}d,s={s:.2f})"
+                        })
+                        continue
+            except:
+                pass
             if s > 0.7:
                 results["boosted"].append({"memory": m, "score": s, "reason": "singleton_high_importance"})
             elif s < 0.25:
@@ -2062,14 +2128,23 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
             # 构建 id→neighbors 映射 (含距离)
             for mid in group_ids:
                 vec_dedup_cache[mid] = {}
-            # 需要逐对查向量距离 (batch_vector_clustering 只返回连通关系)
-            # 改用: 对每对 scored[0] vs scored[i] 查一次
-            for m, s in scored[1:]:
-                neighbors = get_vector_neighbors(best["id"], limit=len(group_ids), max_dist=0.20)
-                for n in neighbors:
-                    if n["id"] == m["id"]:
-                        vec_dedup_cache[m["id"]]["vec_dist_to_best"] = n["distance"]
-                        break
+            # 改用: 一次批量查询 best 对所有 group 成员的向量距离
+            best_id = best["id"]
+            batch_sql = f"""
+                SELECT b.id::text,
+                       ROUND((a.vector <=> b.vector)::numeric, 4) as dist
+                FROM mem0 a, mem0 b
+                WHERE a.id::text = '{best_id}'
+                AND b.id::text IN ('{"','".join(group_ids)}')
+                AND a.id != b.id
+                AND (a.vector <=> b.vector) < 0.20
+            """
+            batch_rows = pg_query(batch_sql)
+            for r in batch_rows:
+                if len(r) >= 2:
+                    dist_val = safe_float(r[1])
+                    if dist_val is not None:
+                        vec_dedup_cache[r[0]]["vec_dist_to_best"] = dist_val
         
         for m, s in scored[1:]:
             # P2: 优先用向量距离判断 (pgvector, 精度最高)
@@ -2178,6 +2253,39 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
              f"{len(results['decay_candidates'])} decay, "
              f"{len(results['contradictions'])} contradictions")
     
+    # P2-2: 跨聚类实体共现 → 关系推断
+    # 扫描所有 cluster 的实体，找出在 ≥2 个 cluster 共现的实体对
+    cross_cluster_relations = []
+    entity_clusters: dict[str, set[str]] = defaultdict(set)
+    for cluster_key, group in clusters.items():
+        cluster_texts = [m["text"][:200] for m in group]
+        entities = extract_entities_with_fallback(cluster_texts, max_entities=5)
+        for ent in entities:
+            if _is_valid_entity(ent):
+                entity_clusters[ent].add(cluster_key)
+    
+    entity_list = list(entity_clusters.keys())
+    co_pairs = []
+    for i in range(len(entity_list)):
+        for j in range(i + 1, len(entity_list)):
+            e1, e2 = entity_list[i], entity_list[j]
+            shared = entity_clusters[e1] & entity_clusters[e2]
+            if len(shared) >= 1:  # P3: 降低阈值，1个共享cluster即可
+                co_pairs.append((e1, e2, len(shared)))
+    
+    co_pairs.sort(key=lambda x: x[2], reverse=True)
+    max_rels = 50  # P3: 增加到50条
+    for e1, e2, count in co_pairs[:max_rels]:
+        conf = min(0.7, 0.3 + count * 0.1)
+        cross_cluster_relations.append({
+            "source": e1, "target": e2,
+            "type": "RELATED_TO", "confidence": conf,
+        })
+    
+    results["cross_cluster_relations"] = cross_cluster_relations
+    if cross_cluster_relations:
+        log.info(f"  🔗 P2-2 跨聚类共现: {len(co_pairs)} 对, 取 top {len(cross_cluster_relations)}")
+    
     return results
 
 
@@ -2271,6 +2379,20 @@ def stage3_deep_sleep(rem_results: dict, dream_run_id: int, dry_run: bool = Fals
     
     # 3. 关系推断 + Neo4j 回写
     neo4j_relations = []
+    
+    # P2-2: 跨聚类实体共现 → 关系推断 (大幅增加关系产出)
+    # 从 rem_results 获取预计算的跨聚类关系
+    for rel in rem_results.get("cross_cluster_relations", []):
+        conn.execute(
+            "INSERT INTO relation_log (dream_run_id, source_entity, target_entity, relation_type, confidence, method) VALUES (?, ?, ?, ?, ?, ?)",
+            (dream_run_id, rel["source"], rel["target"], rel["type"], rel["confidence"], "cross_cluster_cooccurrence")
+        )
+        stats["inferred"] += 1
+        neo4j_relations.append(rel)
+    if rem_results.get("cross_cluster_relations"):
+        log.info(f"  🔗 跨聚类共现: {len(rem_results['cross_cluster_relations'])} 条新关系")
+    
+    # 原有: vault_candidates 关键词关系
     for item in rem_results.get("vault_candidates", []):
         keywords = item.get("keywords", [])
         # 过滤无效实体
@@ -2495,6 +2617,50 @@ def online_dedup_check(text: str, threshold: float = 0.85) -> dict:
 
 # ─── 主循环 ────────────────────────────────────────────────────────────
 
+def _acquire_lock() -> bool:
+    """获取并发锁，防止多个 dream cycle 同时运行"""
+    import os, signal
+    
+    if DREAM_LOCK.exists():
+        try:
+            pid = int(DREAM_LOCK.read_text().strip())
+            # 检查进程是否还活着
+            os.kill(pid, 0)
+            # 检查是否超时
+            lock_age = time.time() - DREAM_LOCK.stat().st_mtime
+            if lock_age > DREAM_LOCK_TIMEOUT:
+                log.warning(f"🔓 锁超时 ({lock_age:.0f}s > {DREAM_LOCK_TIMEOUT}s), PID {pid} 可能是僵尸, 强制接管")
+            else:
+                log.error(f"🔒 另一个 dream cycle 正在运行 (PID {pid}, {lock_age:.0f}s 前)")
+                return False
+        except (ProcessLookupError, ValueError):
+            log.warning(f"🔓 发现过期锁文件 (进程已死), 清理并继续")
+    
+    DREAM_LOCK.write_text(str(os.getpid()))
+    return True
+
+def _release_lock():
+    """释放并发锁"""
+    try:
+        DREAM_LOCK.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def _cleanup_zombie_runs():
+    """清理僵尸 run (started 但 finished_at=NULL 超过 1 小时)"""
+    conn = sqlite3.connect(str(DREAM_DB))
+    cutoff = (datetime.now(HKT) - timedelta(hours=1)).isoformat()
+    cursor = conn.execute("""
+        UPDATE dream_runs 
+        SET finished_at = ?, error = 'zombie: no finish after 1h'
+        WHERE finished_at IS NULL AND started_at < ?
+    """, (datetime.now(HKT).isoformat(), cutoff))
+    cleaned = cursor.rowcount
+    conn.commit()
+    conn.close()
+    if cleaned > 0:
+        log.info(f"🧹 清理了 {cleaned} 个僵尸 run")
+
 def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123") -> dict:
     """
     执行完整的梦循环
@@ -2507,6 +2673,13 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
     start_time = datetime.now(HKT)
     log.info(f"🌙 梦循环启动 @ {start_time.strftime('%Y-%m-%d %H:%M:%S')} HKT "
              f"(hours={hours}, dry_run={dry_run}, stages={stages})")
+    
+    # 并发锁 — 防止多个实例同时运行
+    if not _acquire_lock():
+        return {"status": "skipped", "reason": "another_instance_running"}
+    
+    # 清理僵尸 run
+    _cleanup_zombie_runs()
     
     # 初始化
     dream_conn = init_dream_db()
@@ -2538,6 +2711,7 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
                                   (datetime.now(HKT).isoformat(), json.dumps({"status": "skipped_incremental"}), dream_run_id))
                 dream_conn.commit()
                 dream_conn.close()
+                _release_lock()
                 return {"status": "skipped", "reason": "no_new_memories_incremental"}
             
             all_recent = get_recent_memories(hours)
@@ -2553,6 +2727,7 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
         
         if not memories and not sessions:
             log.warning("⚠️ 没有新记忆或session, 跳过梦循环")
+            _release_lock()
             return {"status": "skipped", "reason": "no_memories"}
         
         # Stage 1: Shallow Sleep
@@ -2695,6 +2870,7 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
         }
         
         log.info(f"🌅 梦循环完成 — {result['duration_seconds']:.1f}s")
+        _release_lock()
         return result
         
     except Exception as e:
@@ -2704,6 +2880,7 @@ def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123")
                           (str(e), datetime.now(HKT).isoformat(), dream_run_id))
         dream_conn.commit()
         dream_conn.close()
+        _release_lock()
         return {"status": "error", "error": str(e)}
 
 
@@ -2861,9 +3038,10 @@ def format_report(result: dict, rem_results: dict = None, stats: dict = None) ->
 
 
 def send_telegram_report(report: str):
-    """通过 Telegram Bot 发送报告 (HTML格式，更安全)"""
+    """通过 Telegram Bot 发送报告"""
     import subprocess
-    import urllib.parse
+    # 用 hermes send_message 或直接 curl
+    # 从 config 读 bot token + chat_id
     try:
         config_path = Path("/root/.hermes/config.yaml")
         if config_path.exists():
@@ -2873,22 +3051,11 @@ def send_telegram_report(report: str):
             token = config.get("telegram", {}).get("bot_token", "")
             chat_id = config.get("telegram", {}).get("home_chat_id", "")
             if token and chat_id:
-                # 用 HTML parse_mode 更安全（Markdown 遇到特殊字符会崩）
-                # 转换 **bold** → <b>bold</b>
-                html_report = report
-                html_report = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', html_report)
-                html_report = html_report.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                # 还原 HTML 标签
-                html_report = html_report.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-                
-                encoded = urllib.parse.quote(html_report, safe='')
-                url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={encoded}&parse_mode=HTML"
-                result = subprocess.run(["curl", "-s", "--max-time", "10", url], 
-                                       timeout=15, capture_output=True, text=True)
-                if result.returncode == 0 and '"ok":true' in result.stdout:
-                    log.info("📱 Telegram 报告已发送")
-                else:
-                    log.warning(f"⚠️ Telegram 发送失败: {result.stdout[:200]}")
+                import urllib.parse
+                encoded = urllib.parse.quote(report, safe='')
+                url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={encoded}&parse_mode=Markdown"
+                subprocess.run(["curl", "-s", url], timeout=10, capture_output=True)
+                log.info("📱 Telegram 报告已发送")
                 return
         log.warning("⚠️ Telegram 配置不完整，跳过发送")
     except Exception as e:
@@ -2978,6 +3145,20 @@ def show_health_dashboard():
     total_relations = conn.execute("SELECT COUNT(*) FROM relation_log").fetchone()[0]
     useful_relations = conn.execute("SELECT COUNT(*) FROM relation_log WHERE confidence >= 0.5").fetchone()[0]
     boosted_relations = conn.execute("SELECT COUNT(*) FROM relation_log WHERE confidence >= 0.6").fetchone()[0]
+    cross_cluster_rels = conn.execute("SELECT COUNT(*) FROM relation_log WHERE method = 'cross_cluster_cooccurrence'").fetchone()[0]
+    
+    # Neo4j 实际关系数 (查询 Playground)
+    neo4j_total = 0
+    neo4j_dream = 0
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        with driver.session() as session:
+            neo4j_total = session.run("MATCH ()-[r]->() RETURN count(r)").single()[0]
+            neo4j_dream = session.run("MATCH ()-[r]->() WHERE r.source = 'dream_cycle' RETURN count(r)").single()[0]
+        driver.close()
+    except:
+        pass
     
     # Vault suggestion 统计
     total_suggestions = conn.execute("SELECT COUNT(*) FROM vault_suggestion").fetchone()[0]
@@ -3005,6 +3186,7 @@ def show_health_dashboard():
     
     print(f"\n🔗 **关系网络**")
     print(f"  总关系: {total_relations} | 高置信(>=0.5): {useful_relations} | LLM Boost(>=0.6): {boosted_relations}")
+    print(f"  跨聚类: {cross_cluster_rels} | Neo4j: {neo4j_dream}/{neo4j_total}")
     
     print(f"\n📝 **Vault 沉淀**")
     print(f"  建议: {total_suggestions} | pending: {pending_suggestions} | auto_created: {auto_created} | reviewed: {reviewed}")
@@ -3016,8 +3198,8 @@ def show_health_dashboard():
     if runs:
         # Sparkline-style 趋势
         clusters_trend = [str(r[2]) for r in runs]
-        dedup_trend = [str(r[5]) for r in runs]
-        inferred_trend = [str(r[6]) for r in runs]
+        dedup_trend = [str(r[4]) for r in runs]     # stage3_deduped (index 4)
+        inferred_trend = [str(r[5]) for r in runs]   # stage3_inferred (index 5)
         vault_trend = [str(r[8]) for r in runs]
         
         print(f"  Clusters: {' → '.join(clusters_trend)}")
@@ -3043,11 +3225,24 @@ def show_health_dashboard():
         print("  无最近7天记录")
     
     # 健康评分 (简化版)
+    # coverage: Neo4j dream关系覆盖了多少记忆 (目标: 10% 记忆有dream关系)
+    mem_count = max(len(all_memories), 1)
+    coverage = min(1.0, neo4j_dream / max(mem_count * 0.1, 1)) if neo4j_dream > 0 else min(1.0, (useful_relations + auto_created) / max(total_manifest * 0.5, 1))
+    
+    # coherence: 矛盾解决率
+    coherence = min(1.0, 1.0 - (total_contra - resolved_contra) / max(total_contra, 1)) if total_contra > 0 else 1.0
+    
+    # efficiency: 处理效率
+    efficiency = min(1.0, 1.0 - max(0, total_manifest - active_manifest) / max(total_manifest, 1))
+    
+    # reachability: Neo4j总关系 vs 记忆量 (目标: 30% 连接有向边)
+    reachability = min(1.0, neo4j_total / max(mem_count * 0.3, 1)) if neo4j_total > 0 else min(1.0, useful_relations / max(total_manifest * 0.3, 1))
+    
     health = {
-        "coverage": min(1.0, (useful_relations + auto_created) / max(total_manifest * 0.5, 1)),
-        "coherence": min(1.0, 1.0 - (total_contra - resolved_contra) / max(len(all_memories), 1)),
-        "efficiency": min(1.0, 1.0 - max(0, total_manifest - active_manifest) / max(total_manifest, 1)),
-        "reachability": min(1.0, useful_relations / max(total_manifest * 0.3, 1)),
+        "coverage": coverage,
+        "coherence": coherence,
+        "efficiency": efficiency,
+        "reachability": reachability,
     }
     score = sum(health[k] * w for k, w in [("coverage", 0.30), ("coherence", 0.25), ("efficiency", 0.20), ("reachability", 0.25)]) * 100
     
@@ -3161,181 +3356,175 @@ def review_vault_suggestions(max_review: int = 5) -> list[dict]:
     return reviewed
 
 
-def resolve_pending_contradictions(max_resolve: int = 50, diff_threshold: float = 0.5,
-                                    dry_run: bool = False) -> list[dict]:
+# ─── P10: 批量积压处理 ─────────────────────────────────────────────────
+
+def batch_resolve_all_conflicts(max_per_run: int = 50) -> dict:
     """
-    P11: 批量处理 pending 矛盾
+    批量处理所有 pending 矛盾 — 每次最多处理 max_per_run 个
     
-    策略:
-    - high_diff (>0.6): 最可能是真矛盾 → LLM判断 SUPERSEDE/EXTEND
-    - mid_diff (0.4-0.6): 多数是语义重复 → LLM判断 ADD/FALSE_POSITIVE
-    - low_diff (<0.4): 不值得LLM调用 → 标记FALSE_POSITIVE
-    
-    SUPERSEDE: 旧记忆标记 archived, 新记忆保留
-    EXTEND: 两条都保留, 关系标记EXTENDS
-    FALSE_POSITIVE: 标记后跳过
-    ADD: 两条都保留, 不冲突
-    
-    Returns: 处理结果列表
+    从 contradiction_log 读取 pending 记录，获取记忆文本，调用 LLM 分类
     """
     conn = sqlite3.connect(str(DREAM_DB))
-    
-    # 获取所有 pending 矛盾, 按diff降序
     pending = conn.execute("""
-        SELECT id, mem1_id, mem2_id, marker, contradiction_type, llm_explanation
-        FROM contradiction_log
-        WHERE resolution = 'pending'
+        SELECT id, mem1_id, mem2_id, marker
+        FROM contradiction_log WHERE resolution = 'pending'
         ORDER BY id
-    """).fetchall()
+        LIMIT ?
+    """, (max_per_run,)).fetchall()
+    total_pending = conn.execute("SELECT COUNT(*) FROM contradiction_log WHERE resolution = 'pending'").fetchone()[0]
     conn.close()
     
     if not pending:
-        print("✅ 没有 pending 矛盾")
-        return []
+        log.info("✅ 无 pending 矛盾需要处理")
+        return {"resolved": 0, "remaining": 0}
     
-    print(f"📋 {len(pending)} 个 pending 矛盾, 处理前 {max_resolve} 个 (diff>{diff_threshold})")
+    log.info(f"🔍 批量矛盾处理: {len(pending)}/{total_pending} pending")
     
-    resolved = []
-    llm_calls = 0
-    auto_resolved = 0
+    resolved_count = 0
+    failed = 0
+    superseded = 0
+    extended = 0
+    false_pos = 0
     
     for row in pending:
-        if len(resolved) >= max_resolve:
-            break
-            
-        cid, mem1_id, mem2_id, marker, ctype, explanation = row
+        cid, mem1_id, mem2_id, marker = row
         
-        # 提取 diff 值
-        diff_val = 0.5  # 默认
-        diff_match = re.search(r'diff=([\d.]+)', marker)
-        if diff_match:
-            diff_val = float(diff_match.group(1))
+        # 获取记忆文本
+        rows1 = pg_query(f"SELECT payload->>'data' FROM mem0 WHERE id::text = '{mem1_id}'")
+        rows2 = pg_query(f"SELECT payload->>'data' FROM mem0 WHERE id::text = '{mem2_id}'")
         
-        # 低于阈值 → 自动 FALSE_POSITIVE
-        if diff_val < diff_threshold:
-            if not dry_run:
-                conn = sqlite3.connect(str(DREAM_DB))
-                conn.execute("UPDATE contradiction_log SET resolution = 'false_positive_auto' WHERE id = ?", (cid,))
-                conn.commit()
-                conn.close()
-            auto_resolved += 1
-            resolved.append({"id": cid, "resolution": "false_positive_auto", "diff": diff_val})
-            continue
-        
-        # 获取两条记忆的文本
-        try:
-            rows1 = pg_query(f"SELECT LEFT(payload->>'data', 300) FROM mem0 WHERE id::text = '{mem1_id}'")
-            rows2 = pg_query(f"SELECT LEFT(payload->>'data', 300) FROM mem0 WHERE id::text = '{mem2_id}'")
-            text1 = rows1[0][0] if rows1 else ""
-            text2 = rows2[0][0] if rows1 else ""
-        except Exception:
-            text1, text2 = "", ""
+        text1 = rows1[0][0] if rows1 and rows1[0][0] else ""
+        text2 = rows2[0][0] if rows2 and rows2[0][0] else ""
         
         if not text1 or not text2:
-            if not dry_run:
-                conn = sqlite3.connect(str(DREAM_DB))
-                conn.execute("UPDATE contradiction_log SET resolution = 'mem_deleted' WHERE id = ?", (cid,))
-                conn.commit()
-                conn.close()
-            resolved.append({"id": cid, "resolution": "mem_deleted", "diff": diff_val})
+            # 记忆已被删除 → 标记为 FALSE_POSITIVE
+            conn = sqlite3.connect(str(DREAM_DB))
+            conn.execute("UPDATE contradiction_log SET resolution = 'false_positive', llm_explanation = ? WHERE id = ?",
+                        ("memory_deleted", cid))
+            conn.commit()
+            conn.close()
+            false_pos += 1
+            resolved_count += 1
             continue
         
         # LLM 判断
-        prompt = f"""判断以下两条记忆之间的关系类型。
-
-记忆A: {text1[:200]}
-记忆B: {text2[:200]}
-
-当前标记: {marker}
-
-请判断:
-1. SUPERSEDE: B是A的更新版本（A已过时/被纠正）→ 返回 SUPERSEDE + 要归档哪条(mem1/mem2)
-2. EXTEND: B补充了A的信息（两者都有效，B更详细）→ 返回 EXTEND
-3. ADD: 两条记忆只是表述不同，实际说的是同一件事（无矛盾）→ 返回 ADD
-4. FALSE_POSITIVE: 不是真正的矛盾（语义差异而非事实矛盾）→ 返回 FALSE_POSITIVE
-
-只输出一行JSON:
-{{"resolution": "SUPERSEDE|EXTEND|ADD|FALSE_POSITIVE", "archive": "mem1|mem2|null", "explanation": "一句话解释"}}"""
-
-        result = _call_infini(prompt, max_tokens=150, temperature=0.1)
-        llm_calls += 1
+        v = llm_verify_contradiction(text1[:300], text2[:300], marker)
         
-        resolution = "unresolved"
-        archive = None
-        llm_explanation = ""
+        if v is None:
+            log.warning(f"  ⚠️ API 失败: {mem1_id[:8]} vs {mem2_id[:8]}")
+            failed += 1
+            continue
         
-        if result:
-            json_match = re.search(r'\{[^{}]+\}', result)
-            if json_match:
-                try:
-                    parsed = json.loads(json_match.group())
-                    resolution = parsed.get("resolution", "unresolved").upper()
-                    archive = parsed.get("archive")
-                    llm_explanation = parsed.get("explanation", "")[:200]
-                except json.JSONDecodeError:
-                    pass
+        ctype = v.get("type", "FALSE_POSITIVE")
+        explanation = v.get("explanation", "")[:200].replace('"', '').replace("'", "")
         
-        # 执行resolution
-        if resolution == "SUPERSEDE" and archive:
-            if not dry_run:
-                # 标记归档的旧记忆
-                old_id = mem1_id if archive == "mem1" else mem2_id
-                try:
-                    pg_query(f"UPDATE mem0 SET payload = payload || '{{\"archived\": true, \"superseded_by\": \"{mem2_id if archive == 'mem1' else mem1_id}\"}}' WHERE id::text = '{old_id}'")
-                except Exception:
-                    pass  # PG JSON concat 可能语法问题，不阻断
-                conn = sqlite3.connect(str(DREAM_DB))
-                conn.execute("UPDATE contradiction_log SET resolution = ?, llm_explanation = ? WHERE id = ?",
-                           (f"supersede_{archive}", llm_explanation, cid))
-                conn.commit()
-                conn.close()
-            resolved.append({"id": cid, "resolution": f"supersede_{archive}", "diff": diff_val, "explanation": llm_explanation})
+        conn = sqlite3.connect(str(DREAM_DB))
+        
+        if ctype == "SUPERSEDE":
+            # 归档较旧的记忆
+            rows_t1 = pg_query(f"SELECT payload->>'created_at' FROM mem0 WHERE id::text = '{mem1_id}'")
+            rows_t2 = pg_query(f"SELECT payload->>'created_at' FROM mem0 WHERE id::text = '{mem2_id}'")
+            t1 = rows_t1[0][0] if rows_t1 and rows_t1[0][0] else ""
+            t2 = rows_t2[0][0] if rows_t2 and rows_t2[0][0] else ""
             
-        elif resolution == "EXTEND":
-            if not dry_run:
-                conn = sqlite3.connect(str(DREAM_DB))
-                conn.execute("UPDATE contradiction_log SET resolution = 'extend', llm_explanation = ? WHERE id = ?",
-                           (llm_explanation, cid))
-                conn.commit()
-                conn.close()
-            resolved.append({"id": cid, "resolution": "extend", "diff": diff_val, "explanation": llm_explanation})
+            older_id = mem1_id if t1 <= t2 else mem2_id
+            newer_id = mem2_id if older_id == mem1_id else mem1_id
             
-        elif resolution == "ADD":
-            if not dry_run:
-                conn = sqlite3.connect(str(DREAM_DB))
-                conn.execute("UPDATE contradiction_log SET resolution = 'add', llm_explanation = ? WHERE id = ?",
-                           (llm_explanation, cid))
-                conn.commit()
-                conn.close()
-            resolved.append({"id": cid, "resolution": "add", "diff": diff_val, "explanation": llm_explanation})
-            
-        elif resolution == "FALSE_POSITIVE":
-            if not dry_run:
-                conn = sqlite3.connect(str(DREAM_DB))
-                conn.execute("UPDATE contradiction_log SET resolution = 'false_positive', llm_explanation = ? WHERE id = ?",
-                           (llm_explanation, cid))
-                conn.commit()
-                conn.close()
-            resolved.append({"id": cid, "resolution": "false_positive", "diff": diff_val, "explanation": llm_explanation})
+            pg_query(f"""UPDATE mem0 SET payload = payload || '{{"archived": true, "archived_reason": "slot_supersede", "superseded_by": "{newer_id}"}}' WHERE id::text = '{older_id}'""")
+            mark_manifest_archived([older_id])
+            superseded += 1
+            log.info(f"  ✅ SUPERSEDE: 归档 {older_id[:8]}")
+        
+        elif ctype == "EXTEND":
+            extended += 1
+            log.info(f"  🔗 EXTEND: {mem1_id[:8]} ↔ {mem2_id[:8]}")
+        
+        else:  # FALSE_POSITIVE
+            false_pos += 1
+        
+        conn.execute("""
+            UPDATE contradiction_log SET contradiction_type = ?, resolution = ?, 
+                   llm_explanation = ?, verified = 1 WHERE id = ?
+        """, (f"SLOT_CONFLICT->{ctype}", ctype, explanation, cid))
+        conn.commit()
+        conn.close()
+        resolved_count += 1
+    
+    remaining = total_pending - resolved_count
+    log.info(f"📊 批量矛盾完成: {resolved_count} resolved (S:{superseded} E:{extended} FP:{false_pos} fail:{failed}), {remaining} remaining")
+    return {"resolved": resolved_count, "remaining": remaining, "superseded": superseded, "extended": extended, "false_positive": false_pos, "failed": failed}
+
+
+def batch_review_all_vault(max_per_run: int = 100) -> dict:
+    """
+    批量处理所有 pending vault 建议
+    
+    freq>=2 → 创建 stub; freq<2 → reject; 已有页面 → reviewed
+    """
+    conn = sqlite3.connect(str(DREAM_DB))
+    pending = conn.execute("""
+        SELECT id, entity, category, frequency, reason
+        FROM vault_suggestion WHERE status = 'pending'
+        ORDER BY frequency DESC
+        LIMIT ?
+    """, (max_per_run,)).fetchall()
+    total_pending = conn.execute("SELECT COUNT(*) FROM vault_suggestion WHERE status='pending'").fetchone()[0]
+    conn.close()
+    
+    if not pending:
+        log.info("✅ 无 pending vault 建议需要处理")
+        return {"processed": 0, "remaining": 0}
+    
+    log.info(f"📝 批量 Vault 审核: {len(pending)}/{total_pending} pending")
+    
+    created = 0
+    rejected = 0
+    exists = 0
+    failed = 0
+    
+    for row in pending:
+        sid, entity, category, freq, reason = row
+        
+        # 检查是否已有 Vault 页面
+        slug = entity.lower().replace(" ", "-")[:50]
+        cat_map = {"markets": "markets", "investment": "markets", "projects": "projects",
+                   "technology": "concepts", "concepts": "concepts"}
+        vault_cat = cat_map.get(category, "concepts")
+        filepath = VAULT_DIR / vault_cat / f"{slug}.md"
+        
+        conn = sqlite3.connect(str(DREAM_DB))
+        
+        if filepath.exists():
+            conn.execute("UPDATE vault_suggestion SET status = 'reviewed' WHERE id = ?", (sid,))
+            conn.commit()
+            conn.close()
+            exists += 1
+            continue
+        
+        if freq < 2:
+            conn.execute("UPDATE vault_suggestion SET status = 'rejected' WHERE id = ?", (sid,))
+            conn.commit()
+            conn.close()
+            rejected += 1
+            continue
+        
+        # 创建 stub
+        keywords = [entity]
+        sample = f"{entity} (出现 {freq} 次, {reason or ''})"
+        vault_path = create_vault_stub(entity, category, keywords, sample, sample_age_days=None)
+        if vault_path:
+            conn.execute("UPDATE vault_suggestion SET status = 'auto_created' WHERE id = ?", (sid,))
+            conn.commit()
+            conn.close()
+            created += 1
+            log.info(f"  📄 创建: {entity} → {vault_path}")
         else:
-            resolved.append({"id": cid, "resolution": "unresolved", "diff": diff_val})
-        
-        # 限速: 每5个暂停1秒
-        if llm_calls % 5 == 0:
-            time.sleep(1)
+            conn.close()
+            failed += 1
     
-    # 汇总
-    counts = {}
-    for r in resolved:
-        res = r["resolution"].split("_")[0] if "_" in r["resolution"] else r["resolution"]
-        counts[res] = counts.get(res, 0) + 1
-    
-    print(f"\n📊 矛盾处理结果:")
-    print(f"  总处理: {len(resolved)} (auto: {auto_resolved}, LLM: {llm_calls})")
-    for res, count in sorted(counts.items(), key=lambda x: -x[1]):
-        print(f"  {res}: {count}")
-    
-    return resolved
+    remaining = total_pending - (created + rejected + exists + failed)
+    log.info(f"📊 批量 Vault 完成: {created} created, {rejected} rejected, {exists} exists, {failed} failed, {remaining} remaining")
+    return {"created": created, "rejected": rejected, "exists": exists, "failed": failed, "remaining": remaining}
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────
@@ -3353,9 +3542,9 @@ def main():
     parser.add_argument("--trigger-check", action="store_true", help="检查是否应该触发梦循环 (自适应触发)")
     parser.add_argument("--health", action="store_true", help="P8: 显示梦循环健康仪表盘 (7天趋势)")
     parser.add_argument("--vault-review", action="store_true", help="P9: 处理 pending vault suggestion")
-    parser.add_argument("--resolve-contradictions", action="store_true", help="P11: 批量处理 pending 矛盾")
-    parser.add_argument("--max-resolve", type=int, default=50, help="P11: 最多处理多少个矛盾")
-    parser.add_argument("--diff-threshold", type=float, default=0.5, help="P11: diff低于此值自动标false_positive")
+    parser.add_argument("--resolve-all", action="store_true", help="P10: 批量处理所有 pending 矛盾")
+    parser.add_argument("--vault-all", action="store_true", help="P10: 批量处理所有 pending vault 建议")
+    parser.add_argument("--backlog", action="store_true", help="P10: 一次性清理所有积压(矛盾+vault)")
     parser.add_argument("--auto", action="store_true", help="自适应模式: 先检查触发条件，满足才执行")
     args = parser.parse_args()
     
@@ -3403,14 +3592,27 @@ def main():
             print(f"  {r['entity']}: {r['action']} → {r.get('status', '?')}")
         return results
     
-    # P11: 批量处理矛盾
-    if args.resolve_contradictions:
-        results = resolve_pending_contradictions(
-            max_resolve=args.max_resolve,
-            diff_threshold=args.diff_threshold,
-            dry_run=args.dry_run,
-        )
-        return results
+    # P10: 批量矛盾处理
+    if args.resolve_all:
+        result = batch_resolve_all_conflicts(max_per_run=50)
+        print(f"🔍 批量矛盾处理: {result}")
+        return result
+    
+    # P10: 批量 Vault 审核
+    if args.vault_all:
+        result = batch_review_all_vault(max_per_run=100)
+        print(f"📝 批量 Vault 审核: {result}")
+        return result
+    
+    # P10: 一键清理积压
+    if args.backlog:
+        print("🧹 开始清理积压...")
+        cr = batch_resolve_all_conflicts(max_per_run=50)
+        vr = batch_review_all_vault(max_per_run=100)
+        print(f"\n📊 积压清理完成:")
+        print(f"  矛盾: {cr}")
+        print(f"  Vault: {vr}")
+        return {"conflicts": cr, "vault": vr}
     
     # 自适应模式: 先检查触发条件
     if args.auto:
