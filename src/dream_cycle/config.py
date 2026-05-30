@@ -226,3 +226,10 @@ def safe_float(val, default=None) -> float | None:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+def text_hash(text: str) -> str:
+    """Return a 16-char hex digest for deduplication."""
+    import re
+    normalized = re.sub(r'\s+', ' ', text.lower().strip())
+    return hashlib.md5(normalized.encode()).hexdigest()[:16]

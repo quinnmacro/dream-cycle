@@ -3,6 +3,8 @@ Dream Cycle — CLI entry point — argparse, command routing
 """
 
 import sys
+import json
+import sqlite3
 import argparse
 import logging
 from datetime import datetime, timezone, timedelta
@@ -12,7 +14,7 @@ from dream_cycle.orchestrator import (
     resolve_slot_conflicts, format_report, send_telegram_report,
     review_vault_suggestions, batch_resolve_all_conflicts, batch_review_all_vault,
 )
-from dream_cycle.health import show_health_dashboard, check_dream_trigger
+from dream_cycle.health import show_health_dashboard, check_dream_trigger, online_dedup_check
 from dream_cycle.session import mine_recent_sessions, generate_session_digest
 
 def main():

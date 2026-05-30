@@ -2,8 +2,8 @@
 Tests for dream_cycle.similarity — text similarity functions
 """
 import pytest
+from dream_cycle.config import text_hash
 from dream_cycle.similarity import (
-    text_hash,
     jaccard_similarity,
     ngram_similarity,
     combined_similarity,

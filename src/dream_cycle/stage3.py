@@ -26,7 +26,7 @@ from dream_cycle.db import (
 from dream_cycle.similarity import combined_similarity, get_vector_neighbors
 from dream_cycle.dream_engine import rem_shy_downscale, rem_threat_simulation
 from dream_cycle.llm import llm_merge_memories, llm_verify_contradiction
-from dream_cycle.entities import _is_valid_entity, extract_entities_with_fallback
+from dream_cycle.entities import _is_valid_entity, extract_entities_with_fallback, _KEYWORD_DOMAIN_BOOST
 from dream_cycle.vault import create_vault_stub
 
 def stage3_deep_sleep(rem_results: dict, dream_run_id: int, dry_run: bool = False, total_memories: int = 0, total_clusters: int = 0) -> dict:
@@ -442,7 +442,8 @@ def resolve_slot_conflicts(conflicts: list[dict], dream_run_id: int, max_resolve
             
             log.info(f"    ✅ SUPERSEDE: 归档 {older_id[:8]}, 保留 {newer_id[:8]} ({explanation[:60]})")
             # 归档旧记忆
-            pg_query(f"""UPDATE mem0 SET payload = payload || '{{"archived": true, "archived_reason": "slot_supersede", "superseded_by": "{newer_id}", "supersede_explanation": "{explanation[:100].replace('"', '')}", "freshness": "outdated", "freshness_source": "dream_cycle_supersede"}}' WHERE id::text = '{older_id}'""")
+            safe_explanation = explanation[:100].replace('"', '').replace("'", "''")
+            pg_query(f"""UPDATE mem0 SET payload = payload || '{{"archived": true, "archived_reason": "slot_supersede", "superseded_by": "{newer_id}", "supersede_explanation": "{safe_explanation}", "freshness": "outdated", "freshness_source": "dream_cycle_supersede"}}' WHERE id::text = '{older_id}'""")
             mark_manifest_archived([older_id])
             resolved.append({"type": "SUPERSEDE", "older": older_id, "newer": newer_id, "explanation": explanation})
         

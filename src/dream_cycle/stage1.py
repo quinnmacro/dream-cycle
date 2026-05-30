@@ -15,7 +15,8 @@ from collections import defaultdict
 from dream_cycle.config import (
     DREAM_DB, CLUSTER_THRESHOLD, CLUSTER_DIST, DEDUP_DIST, MERGE_DIST, log,
 )
-from dream_cycle.similarity import text_hash, combined_similarity, get_vector_neighbors, batch_vector_clustering
+from dream_cycle.config import text_hash
+from dream_cycle.similarity import combined_similarity, get_vector_neighbors, batch_vector_clustering
 from dream_cycle.entities import extract_topic_key, extract_keywords
 
 def stage1_shallow_sleep(memories: list[dict]) -> dict[str, list[dict]]:

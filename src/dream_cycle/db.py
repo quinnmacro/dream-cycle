@@ -29,6 +29,7 @@ from dream_cycle.config import (
     DREAM_DB, STATE_DB, NEO4J_URI, NEO4J_USER, NEO4J_PASS, HKT, log,
     PG_CONTAINER, PG_USER, PG_DB,
 )
+from dream_cycle.config import text_hash
 
 # Module-level cache for recall stats (read once per dream cycle)
 _recall_stats_cache: dict | None = None
@@ -288,12 +289,16 @@ def delete_memory(memory_id: str) -> bool:
 
 
 def update_memory_text(memory_id: str, new_text: str) -> bool:
-    """更新记忆文本"""
-    import subprocess
-    escaped = new_text.replace("'", "''").replace("\\", "\\\\")
-    cmd = f"""docker exec {PG_CONTAINER} psql -U {PG_USER} -d {PG_DB} -c "UPDATE mem0 SET payload = jsonb_set(payload, '{{data}}', '\"{escaped}\"') WHERE id::text = '{memory_id}';" """
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-    return result.returncode == 0
+    """更新记忆文本 — stdin pipe mode, to_jsonb for safe JSON encoding"""
+    safe_id = memory_id.replace("'", "''")
+    safe_text = new_text.replace("'", "''")
+    sql = (
+        f"UPDATE mem0 SET payload = jsonb_set(payload, '{{data}}', "
+        f"to_jsonb('{safe_text}'::text)) "
+        f"WHERE id::text = '{safe_id}' RETURNING id::text"
+    )
+    rows = pg_query(sql)
+    return len(rows) > 0
 
 
 # ─── 相似度计算 (不依赖向量, 用文本hash+jaccard) ──────────────────────

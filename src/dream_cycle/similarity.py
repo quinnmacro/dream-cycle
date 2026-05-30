@@ -15,7 +15,7 @@ from dream_cycle.config import (
     DEDUP_THRESHOLD, MERGE_THRESHOLD, CLUSTER_THRESHOLD,
     safe_float, log,
 )
-from dream_cycle.db import pg_query
+# pg_query imported lazily inside functions that need it
 
 __all__ = [
     "text_hash",
@@ -31,11 +31,6 @@ __all__ = [
 # ─── Text fingerprints & similarity ─────────────────────────────────
 
 
-def text_hash(text: str) -> str:
-    """Return a 16-char hex digest for deduplication."""
-    import re
-    normalized = re.sub(r'\s+', ' ', text.lower().strip())
-    return hashlib.md5(normalized.encode()).hexdigest()[:16]
 
 
 def jaccard_similarity(s1: str, s2: str) -> float:
@@ -77,6 +72,7 @@ def get_vector_neighbors(
 
     Returns list of ``{"id": str, "text": str, "distance": float}``.
     """
+    from dream_cycle.db import pg_query
     sql = f"""\
         SELECT b.id::text,
                LEFT(b.payload->>'data', 200) AS text,
@@ -109,6 +105,7 @@ def batch_vector_clustering(
 
     Returns ``{memory_id: [neighbor_id, ...]}`` (symmetric).
     """
+    from dream_cycle.db import pg_query
     if len(memory_ids) < 2:
         return {}
 

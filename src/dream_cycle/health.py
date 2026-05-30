@@ -22,7 +22,8 @@ from dream_cycle.config import (
     TRIGGER_MEMORY_ENTROPY, DEDUP_THRESHOLD, MERGE_THRESHOLD,
 )
 from dream_cycle.db import pg_query, get_recent_memories, get_incremental_memories, get_all_memories_with_embeddings
-from dream_cycle.similarity import text_hash, combined_similarity
+from dream_cycle.config import text_hash
+from dream_cycle.similarity import combined_similarity
 
 def check_dream_trigger() -> dict:
     """
