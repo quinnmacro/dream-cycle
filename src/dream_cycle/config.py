@@ -5,6 +5,61 @@ All tunable parameters, paths, and shared constants.
 Source of truth for every magic number in the pipeline.
 """
 
+
+
+__all__ = [
+    "HKT",
+    "PG_CONTAINER",
+    "PG_USER",
+    "PG_DB",
+    "NEO4J_URI",
+    "NEO4J_USER",
+    "NEO4J_PASS",
+    "STATE_DB",
+    "DREAM_DB",
+    "VAULT_DIR",
+    "DREAM_LOCK",
+    "DREAM_LOCK_TIMEOUT",
+    "DEDUP_DIST",
+    "MERGE_DIST",
+    "CLUSTER_DIST",
+    "DEDUP_THRESHOLD",
+    "MERGE_THRESHOLD",
+    "CLUSTER_THRESHOLD",
+    "IMPORTANCE_WEIGHTS",
+    "TRIGGER_MAX_IDLE_HOURS",
+    "TRIGGER_MIN_NEW_MEMORIES",
+    "TRIGGER_CONFLICT_DENSITY",
+    "TRIGGER_MEMORY_ENTROPY",
+    "HEBBIAN_LEARNING_RATE",
+    "HEBBIAN_DOWNSCALE",
+    "REM_WALK_LENGTH",
+    "REM_SEED_COUNT",
+    "REM_MAX_NEW_EDGES",
+    "REM_JUMP_PROBABILITY",
+    "WAKING_THRESHOLD",
+    "SHY_PROTECTION_PCT",
+    "SHY_DOWNSCALE_FACTOR",
+    "SHY_PRUNE_THRESHOLD",
+    "PROMOTION_MIN_SCORE",
+    "PROMOTION_MIN_RECALLS",
+    "PROMOTION_MIN_SESSIONS",
+    "PERMANENT_MARKERS",
+    "DECAY_HALF_LIVES",
+    "FADEMEM_BETA",
+    "RETENTION_FLOOR",
+    "SIGNAL_CORRECTIONS",
+    "SIGNAL_PREFERENCES",
+    "SIGNAL_DECISIONS",
+    "SIGNAL_PATTERNS",
+    "ARCHIVE_THRESHOLD_DAYS",
+    "ARCHIVE_MIN_SCORE",
+    "INFINI_BASE_URL",
+    "INFINI_MODEL",
+    "safe_float",
+    "log",
+]
+
 import json
 import hashlib
 import re

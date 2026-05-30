@@ -2,6 +2,14 @@
 Dream Cycle — Health — adaptive trigger, online dedup check, 7-day dashboard
 """
 
+
+
+__all__ = [
+    "check_dream_trigger",
+    "show_health_dashboard",
+    "online_dedup_check",
+]
+
 import json
 import sqlite3
 import time
@@ -45,7 +53,7 @@ def check_dream_trigger() -> dict:
             if idle_hours >= TRIGGER_MAX_IDLE_HOURS:
                 reasons.append(f"idle_{idle_hours:.1f}h>={TRIGGER_MAX_IDLE_HOURS}h")
                 urgency = "medium"
-        except:
+        except Exception:
             pass
     else:
         reasons.append("no_previous_run")
@@ -68,7 +76,7 @@ def check_dream_trigger() -> dict:
             if conflict_density >= TRIGGER_CONFLICT_DENSITY:
                 reasons.append(f"conflict_density_{conflict_density:.2f}>={TRIGGER_CONFLICT_DENSITY}")
                 urgency = "high"
-    except:
+    except Exception:
         pass  # 表可能不存在 (首次运行)
     
     # 4. 记忆熵检查 (重要度分布 — 用 PG 记忆量估算)
@@ -86,7 +94,7 @@ def check_dream_trigger() -> dict:
                 if concentration >= TRIGGER_MEMORY_ENTROPY:
                     reasons.append(f"entropy_{concentration:.2f}>={TRIGGER_MEMORY_ENTROPY}")
                     urgency = max(urgency, "medium")
-    except:
+    except Exception:
         pass
     
     return {
@@ -135,7 +143,7 @@ def show_health_dashboard():
             neo4j_total = session.run("MATCH ()-[r]->() RETURN count(r)").single()[0]
             neo4j_dream = session.run("MATCH ()-[r]->() WHERE r.source = 'dream_cycle' RETURN count(r)").single()[0]
         driver.close()
-    except:
+    except Exception:
         pass
     
     # Vault suggestion 统计
@@ -197,7 +205,7 @@ def show_health_dashboard():
                       f"聚类: {s.get('clusters', '?')} | "
                       f"去重候选: {s.get('dedup_candidates', '?')} | "
                       f"合并候选: {s.get('merge_candidates', '?')}")
-            except:
+            except Exception:
                 print(f"    {summary[:100]}")
     else:
         print("  无最近7天记录")

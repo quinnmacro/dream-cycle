@@ -2,6 +2,14 @@
 Dream Cycle — Stage 3: Deep Sleep — dedup execution, decay archival, relation inference, Neo4j write
 """
 
+
+
+__all__ = [
+    "stage3_deep_sleep",
+    "detect_slot_conflicts",
+    "resolve_slot_conflicts",
+]
+
 import json
 import sqlite3
 import logging

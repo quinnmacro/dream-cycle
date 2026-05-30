@@ -2,6 +2,15 @@
 Dream Cycle — LLM API calls — DashScope (qwen3.7-max) for merge/verify/entity extraction
 """
 
+
+
+__all__ = [
+    "call_llm",
+    "llm_merge_memories",
+    "llm_verify_contradiction",
+    "llm_extract_entities",
+]
+
 import json
 import subprocess
 import logging
@@ -24,14 +33,14 @@ def _get_infini_api_key() -> str:
         key = config.get("credentials", {}).get("infini_api_key", "")
         if key:
             return key
-    except:
+    except Exception:
         pass
     try:
         with open("/root/projects/mem0-selfhost/.env") as f:
             for line in f:
                 if line.startswith("OPENAI_API_KEY="):
                     return line.strip().split("=", 1)[1]
-    except:
+    except Exception:
         pass
     return ""
 

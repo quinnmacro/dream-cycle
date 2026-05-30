@@ -2,6 +2,14 @@
 Dream Cycle — Session mining — recent sessions, signal scanning (corrections/preferences/decisions/patterns)
 """
 
+
+
+__all__ = [
+    "mine_recent_sessions",
+    "scan_session_signals",
+    "generate_session_digest",
+]
+
 import json
 import sqlite3
 import time

@@ -2,6 +2,16 @@
 Dream Cycle — Dream Engine — REM walk v2 (teleport+waking), SHY downscale, threat simulation, Hebbian
 """
 
+
+
+__all__ = [
+    "rem_dream_walk",
+    "rem_shy_downscale",
+    "rem_threat_simulation",
+    "llm_boost_relations",
+    "nrem_hebbian_consolidation",
+]
+
 import math
 import random
 import json

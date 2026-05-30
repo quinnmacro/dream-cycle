@@ -2,6 +2,14 @@
 Dream Cycle — Stage 2: REM — FadeMem dual-layer scoring, contradiction detection, vault candidates
 """
 
+
+
+__all__ = [
+    "stage2_rem",
+    "score_importance",
+    "classify_decay_tier",
+]
+
 import re
 import json
 import math
@@ -101,7 +109,7 @@ def score_importance(memory: dict, recall_count: int = 0, session_count: int = 0
         else:
             scores["recency"] = 0.5
             scores["decay_tier"] = "normal"
-    except:
+    except Exception:
         scores["recency"] = 0.5
         scores["decay_tier"] = "normal"
     
@@ -156,7 +164,7 @@ def score_importance(memory: dict, recall_count: int = 0, session_count: int = 0
         else:
             # 无近邻 = 高度独特 = 高 novelty
             scores["novelty"] = 0.9
-    except:
+    except Exception:
         # fallback: 用文本长度和唯一词比估算
         if word_count > 20:
             scores["novelty"] = min(1.0, (unique_words / max(word_count, 1)))
@@ -286,7 +294,7 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
                             "reason": f"age_based({age_days:.0f}d>{ARCHIVE_THRESHOLD_DAYS}d,s={s:.2f})"
                         })
                         continue
-            except:
+            except Exception:
                 pass
             if s > 0.7:
                 results["boosted"].append({"memory": m, "score": s, "reason": "singleton_high_importance"})

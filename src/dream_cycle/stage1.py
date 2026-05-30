@@ -2,6 +2,12 @@
 Dream Cycle — Stage 1: Shallow Sleep — topic clustering + vector clustering + singleton detection
 """
 
+
+
+__all__ = [
+    "stage1_shallow_sleep",
+]
+
 import json
 import sqlite3
 import logging

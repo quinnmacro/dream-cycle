@@ -2,6 +2,14 @@
 Dream Cycle — Vault integration — age computation, time-sensitivity, vault stub creation, topic keys
 """
 
+
+
+__all__ = [
+    "create_vault_stub",
+    "is_time_sensitive",
+    "compute_memory_age_days",
+]
+
 import os
 import re
 import logging

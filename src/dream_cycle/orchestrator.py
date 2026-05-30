@@ -2,6 +2,17 @@
 Dream Cycle — Orchestrator — main pipeline, lock management, report formatting, batch operations
 """
 
+
+
+__all__ = [
+    "run_dream_cycle",
+    "format_report",
+    "send_telegram_report",
+    "review_vault_suggestions",
+    "batch_resolve_all_conflicts",
+    "batch_review_all_vault",
+]
+
 import os
 import json
 import time
@@ -80,253 +91,305 @@ def _cleanup_zombie_runs():
     if cleaned > 0:
         log.info(f"🧹 清理了 {cleaned} 个僵尸 run")
 
+def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
+    """
+    Phase 1: Fetch memories and session signals.
+
+    Returns ``(memories, sessions, signals)`` or *None* if nothing to process.
+    """
+    memories = get_incremental_memories(hours)
+    log.info(f"📊 获取到 {len(memories)} 条新记忆 (最近 {hours} 小时, 增量)")
+
+    # Fallback to full scan if incremental is too thin
+    if len(memories) < 5:
+        conn_check = sqlite3.connect(str(DREAM_DB))
+        manifest_count = conn_check.execute(
+            "SELECT COUNT(*) FROM processed_manifest WHERE status='active'"
+        ).fetchone()[0]
+        conn_check.close()
+
+        if manifest_count > 10 and len(memories) == 0:
+            return None  # genuinely nothing new
+
+        all_recent = get_recent_memories(hours)
+        if len(all_recent) > len(memories) * 3:
+            log.info(f"  ⚠️ 增量太少({len(memories)}), 回退到全量({len(all_recent)})")
+            memories = all_recent
+
+    # Session mining
+    sessions = mine_recent_sessions(hours)
+    session_digest = generate_session_digest(sessions)
+    log.info(f"📋 近期 session: {len(sessions)} 个")
+    log.info(session_digest)
+
+    # Session signal scanning (from Anthropic autoDream)
+    signals = scan_session_signals(hours)
+    total_signals = sum(len(v) for v in signals.values())
+    if total_signals > 0:
+        log.info(
+            f"📡 Session 信号: {total_signals} 条 "
+            f"(纠正={len(signals['corrections'])}, "
+            f"偏好={len(signals['preferences'])}, "
+            f"决策={len(signals['decisions'])}, "
+            f"模式={len(signals['patterns'])})"
+        )
+        for sig_type, sigs in signals.items():
+            for sig in sigs[:5]:
+                memories.append({
+                    "id": f"signal_{sig_type}_{sig['timestamp']:.0f}",
+                    "text": f"[SESSION_{sig_type.upper()}] {sig['text']}",
+                    "created_at": datetime.fromtimestamp(
+                        sig["timestamp"], tz=timezone.utc
+                    ).isoformat(),
+                    "source": "session_signal",
+                    "signal_type": sig_type,
+                    "session_title": sig.get("session_title", ""),
+                })
+    else:
+        log.info("📡 Session 信号: 0 条")
+
+    return memories, sessions, signals
+
+
+def _execute_stages(
+    memories: list[dict],
+    stages: str,
+    dry_run: bool,
+    dream_run_id: int,
+) -> tuple[dict, dict, dict, list[dict]]:
+    """
+    Phase 2: Run pipeline stages 1-3 + dream engine + Hebbian + slot conflicts.
+
+    Returns ``(clusters, rem_results, stats, dream_walk_edges)``.
+    """
+    clusters: dict = {}
+    if "1" in stages:
+        clusters = stage1_shallow_sleep(memories)
+
+    rem_results: dict = {}
+    if "2" in stages:
+        rem_results = stage2_rem(clusters)
+
+    stats: dict = {}
+    if "3" in stages:
+        stats = stage3_deep_sleep(
+            rem_results, dream_run_id, dry_run,
+            total_memories=len(memories),
+            total_clusters=len(clusters),
+        )
+
+    # REM dream walk (Neo4j random walk v2)
+    dream_walk_edges: list[dict] = []
+    if "2" in stages and not dry_run:
+        all_cluster_entities: list[str] = []
+        for _ck, group in clusters.items():
+            texts = [m["text"][:200] for m in group]
+            ents = extract_entities_with_fallback(texts, max_entities=3)
+            all_cluster_entities.extend(ents)
+
+        dream_walk_edges = rem_dream_walk(cluster_entities=all_cluster_entities)
+        if dream_walk_edges:
+            dream_walk_edges = llm_boost_relations(dream_walk_edges, clusters, max_boost=10)
+            written = write_relations_to_neo4j(dream_walk_edges)
+            stats["dream_walk"] = written
+            conn_rl = sqlite3.connect(str(DREAM_DB))
+            for e in dream_walk_edges:
+                conn_rl.execute(
+                    "INSERT INTO relation_log "
+                    "(dream_run_id, source_entity, target_entity, relation_type, confidence, method) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (dream_run_id, e["source"], e["target"],
+                     "DREAM_WALK", e["confidence"], "rem_dream_walk"),
+                )
+            conn_rl.commit()
+            conn_rl.close()
+
+    # NREM Hebbian consolidation
+    if "3" in stages and not dry_run:
+        hebbian_stats = nrem_hebbian_consolidation()
+        stats["hebbian_strengthened"] = hebbian_stats.get("strengthened", 0)
+        stats["hebbian_downscaled"] = hebbian_stats.get("downscaled", 0)
+
+    # Slot conflict detection
+    if "2" in stages:
+        slot_conflicts = detect_slot_conflicts()
+        if slot_conflicts:
+            conn_sc = sqlite3.connect(str(DREAM_DB))
+            for c in slot_conflicts:
+                conn_sc.execute(
+                    "INSERT INTO contradiction_log "
+                    "(dream_run_id, mem1_id, mem2_id, marker, contradiction_type, llm_explanation, verified) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (dream_run_id, c["mem1_id"], c["mem2_id"],
+                     f"slot_conflict(sim={c['slot_similarity']:.2f},diff={c['value_diff']:.2f})",
+                     "SLOT_CONFLICT",
+                     f"同槽不同值: 槽相似度={c['slot_similarity']:.2f}, 值差异={c['value_diff']:.2f}",
+                     0),
+                )
+            conn_sc.commit()
+            conn_sc.close()
+            stats["slot_conflicts"] = len(slot_conflicts)
+            rem_results["slot_conflicts_list"] = slot_conflicts
+
+    return clusters, rem_results, stats, dream_walk_edges
+
+
+def _finalize_run(
+    dream_run_id: int,
+    memories: list[dict],
+    clusters: dict,
+    rem_results: dict,
+    stats: dict,
+    dry_run: bool,
+    start_time: datetime,
+) -> dict:
+    """
+    Phase 3: Update manifest, record results, return summary.
+    """
+    # Update manifest (incremental tracking)
+    if memories and not dry_run:
+        update_manifest(memories, dream_run_id)
+        log.info(f"  📋 Manifest 已更新: {len(memories)} 条标记为已处理")
+
+        archived_ids = [
+            item["remove"]["id"]
+            for item in rem_results.get("dedup_candidates", [])
+        ]
+        if archived_ids:
+            mark_manifest_archived(archived_ids)
+
+    # Record in dream_runs
+    end_time = datetime.now(HKT)
+    dream_conn = sqlite3.connect(str(DREAM_DB))
+    dream_conn.execute("""        UPDATE dream_runs SET
+            finished_at = ?,
+            stage1_clusters = ?,
+            stage2_boosted = ?,
+            stage3_deduped = ?,
+            stage3_inferred = ?,
+            stage3_decayed = ?,
+            stage3_vault_suggestions = ?,
+            summary = ?
+        WHERE id = ?
+    """, (
+        end_time.isoformat(),
+        len(clusters),
+        len(rem_results.get("boosted", [])),
+        stats.get("deduped", 0),
+        stats.get("inferred", 0),
+        stats.get("decayed", 0),
+        stats.get("vault_suggestions", 0),
+        json.dumps({
+            "memories_scanned": len(memories),
+            "clusters": len(clusters),
+            "dedup_candidates": len(rem_results.get("dedup_candidates", [])),
+            "merge_candidates": len(rem_results.get("merge_candidates", [])),
+            "vault_candidates": len(rem_results.get("vault_candidates", [])),
+            "decay_candidates": len(rem_results.get("decay_candidates", [])),
+        }, ensure_ascii=False),
+        dream_run_id,
+    ))
+    dream_conn.commit()
+    dream_conn.close()
+
+    result = {
+        "status": "success",
+        "dream_run_id": dream_run_id,
+        "memories_scanned": len(memories),
+        "clusters": len(clusters),
+        "deduped": stats.get("deduped", 0),
+        "inferred": stats.get("inferred", 0),
+        "decayed": stats.get("decayed", 0),
+        "vault_suggestions": stats.get("vault_suggestions", 0),
+        "boosted": stats.get("boosted", 0),
+        "duration_seconds": (end_time - start_time).total_seconds(),
+        "rem_results": rem_results,
+        "stats": stats,
+    }
+
+    log.info(f"🌅 梦循环完成 — {result['duration_seconds']:.1f}s")
+    return result
+
+
 def run_dream_cycle(hours: int = 48, dry_run: bool = False, stages: str = "123") -> dict:
     """
-    执行完整的梦循环
-    
+    Execute the full dream cycle pipeline.
+
     Args:
-        hours: 回溯多少小时的记忆
-        dry_run: 只分析不执行
-        stages: 执行哪些阶段 (1/2/3/12/23/123)
+        hours: how many hours of memories to scan
+        dry_run: analyze only, don't execute
+        stages: which stages to run (1/2/3/12/23/123)
     """
     start_time = datetime.now(HKT)
-    log.info(f"🌙 梦循环启动 @ {start_time.strftime('%Y-%m-%d %H:%M:%S')} HKT "
-             f"(hours={hours}, dry_run={dry_run}, stages={stages})")
-    
-    # 并发锁 — 防止多个实例同时运行
+    log.info(
+        f"🌙 梦循环启动 @ {start_time.strftime('%Y-%m-%d %H:%M:%S')} HKT "
+        f"(hours={hours}, dry_run={dry_run}, stages={stages})"
+    )
+
     if not _acquire_lock():
         return {"status": "skipped", "reason": "another_instance_running"}
-    
-    # 清理僵尸 run
+
     _cleanup_zombie_runs()
-    
-    # 初始化
+
     dream_conn = init_dream_db()
     cursor = dream_conn.execute(
         "INSERT INTO dream_runs (started_at) VALUES (?)",
-        (start_time.isoformat(),)
+        (start_time.isoformat(),),
     )
     dream_run_id = cursor.lastrowid
     dream_conn.commit()
     dream_conn.close()
-    
+
     try:
-        # 增量获取记忆 (O(1) manifest 过滤)
-        memories = get_incremental_memories(hours)
-        log.info(f"📊 获取到 {len(memories)} 条新记忆 (最近 {hours} 小时, 增量)")
-        
-        # 如果增量太少，回退到全量 (首次运行或长时间未运行)
-        # 但如果是 0 新增且有已处理记录 → 真的没新数据，不回退
-        if len(memories) < 5:
-            conn_check = sqlite3.connect(str(DREAM_DB))
-            manifest_count = conn_check.execute("SELECT COUNT(*) FROM processed_manifest WHERE status='active'").fetchone()[0]
-            conn_check.close()
-            
-            if manifest_count > 10 and len(memories) == 0:
-                log.info(f"  ✅ 无新记忆 (已处理 {manifest_count} 条), 跳过梦循环")
-                # 更新 dream_runs 为跳过
-                dream_conn = sqlite3.connect(str(DREAM_DB))
-                dream_conn.execute("UPDATE dream_runs SET finished_at = ?, summary = ? WHERE id = ?",
-                                  (datetime.now(HKT).isoformat(), json.dumps({"status": "skipped_incremental"}), dream_run_id))
-                dream_conn.commit()
-                dream_conn.close()
-                _release_lock()
-                return {"status": "skipped", "reason": "no_new_memories_incremental"}
-            
-            all_recent = get_recent_memories(hours)
-            if len(all_recent) > len(memories) * 3:
-                log.info(f"  ⚠️ 增量太少({len(memories)}), 回退到全量({len(all_recent)})")
-                memories = all_recent
-        
-        # 挖掘近期 session
-        sessions = mine_recent_sessions(hours)
-        session_digest = generate_session_digest(sessions)
-        log.info(f"📋 近期 session: {len(sessions)} 个")
-        log.info(session_digest)
-        
-        # ── Session Signal Scanning (from Anthropic autoDream) ──
-        # 扫描用户消息提取纠正/偏好/决策/模式信号
-        session_signals = scan_session_signals(hours)
-        total_signals = sum(len(v) for v in session_signals.values())
-        if total_signals > 0:
-            log.info(f"📡 Session 信号: {total_signals} 条 "
-                     f"(纠正={len(session_signals['corrections'])}, "
-                     f"偏好={len(session_signals['preferences'])}, "
-                     f"决策={len(session_signals['decisions'])}, "
-                     f"模式={len(session_signals['patterns'])})")
-            # 将信号注入为高优先级记忆候选 (加入 memories 列表)
-            for sig_type, sigs in session_signals.items():
-                for sig in sigs[:5]:  # 每类最多5条
-                    memories.append({
-                        "id": f"signal_{sig_type}_{sig['timestamp']:.0f}",
-                        "text": f"[SESSION_{sig_type.upper()}] {sig['text']}",
-                        "created_at": datetime.fromtimestamp(sig['timestamp'], tz=timezone.utc).isoformat(),
-                        "source": "session_signal",
-                        "signal_type": sig_type,
-                        "session_title": sig.get("session_title", ""),
-                    })
-        else:
-            log.info("📡 Session 信号: 0 条")
-        
+        # Phase 1: Prepare
+        prepared = _prepare_memories(hours)
+        if prepared is None:
+            log.info("  ✅ 无新记录, 跳过梦循环")
+            _skip_run(dream_run_id, "no_new_memories_incremental")
+            _release_lock()
+            return {"status": "skipped", "reason": "no_new_memories_incremental"}
+
+        memories, sessions, signals = prepared
         if not memories and not sessions:
             log.warning("⚠️ 没有新记忆或session, 跳过梦循环")
             _release_lock()
             return {"status": "skipped", "reason": "no_memories"}
-        
-        # Stage 1: Shallow Sleep
-        clusters = {}
-        if "1" in stages:
-            clusters = stage1_shallow_sleep(memories)
-        
-        # Stage 2: REM
-        rem_results = {}
-        if "2" in stages:
-            rem_results = stage2_rem(clusters)
-        
-        # Stage 3: Deep Sleep
-        stats = {}
-        if "3" in stages:
-            stats = stage3_deep_sleep(
-                rem_results, dream_run_id, dry_run,
-                total_memories=len(memories),
-                total_clusters=len(clusters),
-            )
-        
-        # ── P1: REM 梦游 (从 Neo4j 高重要性节点随机游走) ──
-        dream_walk_edges = []
-        if "2" in stages and not dry_run:
-            # P10: 传当前 cluster 实体给梦游做种子
-            # 从 clusters 提取所有实体
-            all_cluster_entities = []
-            for ck, group in clusters.items():
-                texts = [m["text"][:200] for m in group]
-                ents = extract_entities_with_fallback(texts, max_entities=3)
-                all_cluster_entities.extend(ents)
-            
-            dream_walk_edges = rem_dream_walk(cluster_entities=all_cluster_entities)
-            if dream_walk_edges:
-                # P1 扩展: LLM Boost — 对高共现关系从0.3→0.6
-                dream_walk_edges = llm_boost_relations(dream_walk_edges, clusters, max_boost=10)
-                # 写入 Neo4j
-                written = write_relations_to_neo4j(dream_walk_edges)
-                stats["dream_walk"] = written
-                # 记录到 relation_log
-                conn_rl = sqlite3.connect(str(DREAM_DB))
-                for e in dream_walk_edges:
-                    conn_rl.execute(
-                        "INSERT INTO relation_log (dream_run_id, source_entity, target_entity, relation_type, confidence, method) VALUES (?, ?, ?, ?, ?, ?)",
-                        (dream_run_id, e["source"], e["target"], "DREAM_WALK", e["confidence"], "rem_dream_walk")
-                    )
-                conn_rl.commit()
-                conn_rl.close()
-        
-        # ── P2: NREM Hebbian 强化 (关系权重调整) ──
-        hebbian_stats = {}
-        if "3" in stages and not dry_run:
-            hebbian_stats = nrem_hebbian_consolidation()
-            stats["hebbian_strengthened"] = hebbian_stats.get("strengthened", 0)
-            stats["hebbian_downscaled"] = hebbian_stats.get("downscaled", 0)
-        
-        # ── P3: 语义签名冲突检测 (同槽不同值) ──
-        slot_conflicts = []
-        if "2" in stages:
-            slot_conflicts = detect_slot_conflicts()
-            if slot_conflicts:
-                # 记录到 contradiction_log
-                conn_sc = sqlite3.connect(str(DREAM_DB))
-                for c in slot_conflicts:
-                    conn_sc.execute(
-                        "INSERT INTO contradiction_log (dream_run_id, mem1_id, mem2_id, marker, contradiction_type, llm_explanation, verified) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (dream_run_id, c["mem1_id"], c["mem2_id"], 
-                         f"slot_conflict(sim={c['slot_similarity']:.2f},diff={c['value_diff']:.2f})",
-                         "SLOT_CONFLICT", 
-                         f"同槽不同值: 槽相似度={c['slot_similarity']:.2f}, 值差异={c['value_diff']:.2f}",
-                         0)
-                    )
-                conn_sc.commit()
-                conn_sc.close()
-                stats["slot_conflicts"] = len(slot_conflicts)
-                # P7: 保存列表供 stage3 自动处理
-                rem_results["slot_conflicts_list"] = slot_conflicts
-        
-        # 更新 manifest (O(1) 增量追踪)
-        if memories and not dry_run:
-            update_manifest(memories, dream_run_id)
-            log.info(f"  📋 Manifest 已更新: {len(memories)} 条标记为已处理")
-            
-            # 标记已归档的记忆
-            archived_ids = []
-            for item in rem_results.get("dedup_candidates", []):
-                archived_ids.append(item["remove"]["id"])
-            if archived_ids:
-                mark_manifest_archived(archived_ids)
-        
-        # 更新 dream_runs
-        end_time = datetime.now(HKT)
-        dream_conn = sqlite3.connect(str(DREAM_DB))
-        dream_conn.execute("""
-            UPDATE dream_runs SET
-                finished_at = ?,
-                stage1_clusters = ?,
-                stage2_boosted = ?,
-                stage3_deduped = ?,
-                stage3_inferred = ?,
-                stage3_decayed = ?,
-                stage3_vault_suggestions = ?,
-                summary = ?
-            WHERE id = ?
-        """, (
-            end_time.isoformat(),
-            len(clusters),
-            len(rem_results.get("boosted", [])),
-            stats.get("deduped", 0),
-            stats.get("inferred", 0),
-            stats.get("decayed", 0),
-            stats.get("vault_suggestions", 0),
-            json.dumps({
-                "memories_scanned": len(memories),
-                "clusters": len(clusters),
-                "dedup_candidates": len(rem_results.get("dedup_candidates", [])),
-                "merge_candidates": len(rem_results.get("merge_candidates", [])),
-                "vault_candidates": len(rem_results.get("vault_candidates", [])),
-                "decay_candidates": len(rem_results.get("decay_candidates", [])),
-            }, ensure_ascii=False),
-            dream_run_id,
-        ))
-        dream_conn.commit()
-        dream_conn.close()
-        
-        result = {
-            "status": "success",
-            "dream_run_id": dream_run_id,
-            "memories_scanned": len(memories),
-            "clusters": len(clusters),
-            "deduped": stats.get("deduped", 0),
-            "inferred": stats.get("inferred", 0),
-            "decayed": stats.get("decayed", 0),
-            "vault_suggestions": stats.get("vault_suggestions", 0),
-            "boosted": stats.get("boosted", 0),
-            "duration_seconds": (end_time - start_time).total_seconds(),
-            # P6: 嵌入详情供 format_report 使用
-            "rem_results": rem_results,
-            "stats": stats,
-        }
-        
-        log.info(f"🌅 梦循环完成 — {result['duration_seconds']:.1f}s")
+
+        # Phase 2: Execute stages
+        clusters, rem_results, stats, dream_walk_edges = _execute_stages(
+            memories, stages, dry_run, dream_run_id,
+        )
+
+        # Phase 3: Finalize
+        result = _finalize_run(
+            dream_run_id, memories, clusters, rem_results, stats,
+            dry_run, start_time,
+        )
         _release_lock()
         return result
-        
+
     except Exception as e:
         log.error(f"❌ 梦循环失败: {e}", exc_info=True)
         dream_conn = sqlite3.connect(str(DREAM_DB))
-        dream_conn.execute("UPDATE dream_runs SET error = ?, finished_at = ? WHERE id = ?",
-                          (str(e), datetime.now(HKT).isoformat(), dream_run_id))
+        dream_conn.execute(
+            "UPDATE dream_runs SET error = ?, finished_at = ? WHERE id = ?",
+            (str(e), datetime.now(HKT).isoformat(), dream_run_id),
+        )
         dream_conn.commit()
         dream_conn.close()
         _release_lock()
         return {"status": "error", "error": str(e)}
 
 
+def _skip_run(dream_run_id: int, reason: str) -> None:
+    """Mark a dream run as skipped in the database."""
+    conn = sqlite3.connect(str(DREAM_DB))
+    conn.execute(
+        "UPDATE dream_runs SET finished_at = ?, summary = ? WHERE id = ?",
+        (datetime.now(HKT).isoformat(), json.dumps({"status": reason}), dream_run_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def format_report(result: dict, rem_results: dict = None, stats: dict = None) -> str:

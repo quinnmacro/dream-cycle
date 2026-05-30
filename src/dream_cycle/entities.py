@@ -2,6 +2,15 @@
 Dream Cycle — Entity extraction — topic keywords, keyword extraction, LLM-based, fallback chain
 """
 
+
+
+__all__ = [
+    "extract_topic_key",
+    "extract_keywords",
+    "extract_entities_with_fallback",
+    "is_valid_entity",
+]
+
 import re
 import json
 import logging

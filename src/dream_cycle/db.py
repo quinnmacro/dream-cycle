@@ -2,6 +2,23 @@
 Dream Cycle — Database operations — PG (mem0), SQLite (dream_cycle.db, state.db), Neo4j Playground
 """
 
+
+
+__all__ = [
+    "get_recall_stats",
+    "init_dream_db",
+    "pg_query",
+    "get_recent_memories",
+    "get_incremental_memories",
+    "update_manifest",
+    "mark_manifest_archived",
+    "get_all_memories_with_embeddings",
+    "delete_memory",
+    "update_memory_text",
+    "dedup_neo4j_relations",
+    "write_relations_to_neo4j",
+]
+
 import json
 import sqlite3
 import subprocess
@@ -47,7 +64,7 @@ def get_recall_stats() -> dict[str, int]:
                         query = args.get("query", "").strip()
                         if query and len(query) > 3:
                             stats[query] = stats.get(query, 0) + 1
-            except:
+            except Exception:
                 continue
         conn.close()
     except Exception as e:
