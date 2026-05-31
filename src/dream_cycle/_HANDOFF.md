@@ -23,41 +23,54 @@
 
 Quinn（我们共同的用户）让你做 audit，让我做日常维护。我们之间没有直接通信通道，靠 Quinn 中转和文件系统。
 
-## 当前状态（2026-05-30 晚）
+## 当前状态（2026-05-31 v3.3.0）
 
-### 刚完成的大重构
-- 从 4097 行单文件 → 15 模块包（最大 696 行）
-- 加了 45 个单元测试（全绿）
-- 修了 P0 致命 bug（float('') 崩溃、无并发锁、僵尸 run）
-- 健康度从 46 → 91/100
-- 已 push 到 GitHub (commits: 79bffc4, 0f9a621, 431d11f, c3acf66)
+### v3.3.0 变更（Claude Code 审计后修复）
+**commit**: 96aa294 (foxcc/feat: v3.3.0)
 
-### 15 个模块
-```
-__init__.py    — 版本号
-__main__.py    — CLI 入口 (argparse)
-config.py      — 所有参数常量 (阈值/权重/路径/API)
-db.py          — PG(docker exec) + SQLite + Neo4j 查询
-llm.py         — DashScope qwen3.7-max LLM 调用
-similarity.py  — 文本相似度 + 向量聚类
-entities.py    — 实体提取 (LLM + 规则)
-stage1.py      — Shallow Sleep: 四层聚类
-stage2.py      — REM: 7维评分 + 矛盾检测 + 关系推断
-stage3.py      — Deep Sleep: 去重/合并/衰减/回写
-dream_engine.py — Neo4j 图操作 (REM walk/SHY/threat)
-session.py     — state.db 信号扫描
-vault.py       — Vault stub 创建
-health.py      — 自适应触发 + 健康仪表盘
-orchestrator.py — 主循环 + 锁 + 报告 + 批量运维
-```
+#### 10 个关键 Bug 修复
+**Tier 1 — NameError 崩溃（3个）**
+- `__main__.py`: 缺失 `json`, `sqlite3`, `online_dedup_check` 导入 → 3 个 CLI 命令崩溃
+- `db.py:236`: 缺失 `text_hash` 导入 → `update_manifest()` 每次必崩
+- `stage3.py:262`: 缺失 `_KEYWORD_DOMAIN_BOOST` 导入 → vault 建议处理崩溃
 
-### 已知架构债务（你 audit 可能也会发现）
+**Tier 2 — 安全漏洞（2个）**
+- `db.py update_memory_text()`: `shell=True` + 手工转义 → shell 注入。已改用 stdin pipe + `to_jsonb()`
+- `stage3.py resolve_slot_conflicts()`: LLM explanation 单引号截断 SQL → SUPERSEDE 归档静默失败
+
+**Tier 3 — 逻辑错误（3个）**
+- `stage2.py:224`: recall_count 回退值用 `len(group)` → 大 cluster 评分虚高。已改为 0
+- `stage2.py:384`: vault 门控 `passes_any` 恒真 → 三重门限形同虚设。已删除
+- `orchestrator.py:353`: no_memories 跳过路径缺 `_skip_run()` → dream_runs 孤儿记录
+
+**Tier 4 — 一致性（2个）**
+- `orchestrator.py` slug 生成缺 `|` 替换 → 与 vault.py 不一致
+- `db.py pg_query` 签名撒谎（params 参数是空壳，返回类型标注错误）
+
+#### 性能优化（100-150x 提升）
+- `detect_slot_conflicts`: 批量查询 IDs+文本+向量邻居（2次 docker exec vs ~200次）
+- `batch_resolve_all_conflicts`: 预取所有文本+时间戳（1次 docker exec vs ~150次）
+- `stage2→orchestrator`: 缓存 `cluster_entities` 到 `rem_results`，避免重复 LLM 提取
+- `llm.py`: API key 模块级缓存，避免每次调用读 config.yaml
+
+#### 代码质量改进
+- `text_hash` 从 `config.py` 移到 `similarity.py`（消除循环依赖）
+- 所有导入路径已同步更新（db.py, health.py, stage1.py, tests）
+
+#### 验证状态
+- ✅ 45 个单元测试全通过
+- ✅ 所有 CLI 命令正常（--manifest-stats, --history, --dedup-check, --dry-run）
+- ✅ 所有模块导入检查通过
+
+### 已知架构债务（待后续处理）
 1. **PG 查询走 `docker exec`** — 每次 1-3 秒，应该换 psycopg2
 2. **无测试 fixtures** — 45 个测试全是 mock，没有集成测试
-3. **`docker exec` 的 SQL 注入风险** — 用字符串拼接而非参数化
-4. **Neo4j Playground 经常不在线** — 7687 端口连接拒绝时所有图操作静默失败
-5. **LLM 调用走 curl subprocess** — 应该换 `requests` 或 `urllib`
-6. **config.py 参数太多（40+）** — 部分可以合并或分组
+3. **Neo4j Playground 经常不在线** — 7687 端口连接拒绝时所有图操作静默失败
+4. **LLM 调用走 curl subprocess** — 应该换 `requests` 或 `urllib`
+5. **config.py 参数太多（40+）** — 部分可以合并或分组
+
+**已修复的债务**：
+- ~~`docker exec` 的 SQL 注入风险~~ → `update_memory_text()` 已改用 stdin pipe（其他函数仍有风险，但优先级低）
 
 ### 运行方式
 ```bash
