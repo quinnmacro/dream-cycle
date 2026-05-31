@@ -3,7 +3,7 @@ Dream Cycle — Modular Memory Consolidation Engine
 ===================================================
 Bio-inspired sleep cycle for AI agent memory.
 
-Architecture (v3.2, 2026-05-30):
+Architecture (v3.3, 2026-05-31):
   config.py         — Constants & parameters
   db.py             — Database operations (PG/SQLite/Neo4j)
   similarity.py     — Similarity functions & vector ops
@@ -20,11 +20,18 @@ Architecture (v3.2, 2026-05-30):
 """
 
 from dream_cycle.config import (
-    DREAM_DB, DREAM_LOCK, DREAM_LOCK_TIMEOUT,
-    STATE_DB, NEO4J_URI, NEO4J_USER, NEO4J_PASS,
-    INFINI_BASE_URL, INFINI_MODEL, HKT,
+    DREAM_DB,
+    DREAM_LOCK,
+    DREAM_LOCK_TIMEOUT,
+    STATE_DB,
+    NEO4J_URI,
+    NEO4J_USER,
+    NEO4J_PASS,
+    INFINI_BASE_URL,
+    INFINI_MODEL,
+    HKT,
 )
 from dream_cycle.orchestrator import run_dream_cycle
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 __all__ = ["run_dream_cycle", "DREAM_DB", "__version__"]

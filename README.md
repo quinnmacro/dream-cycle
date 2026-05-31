@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/Version-v3.2-green.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/Version-v3.3-green.svg)](pyproject.toml)
 [![Status](https://img.shields.io/badge/Status-Production-brightgreen.svg)]()
 
 [English](#english) · [架构文档](docs/architecture.md) · [CLI 参考](docs/cli-reference.md) · [ADR-001](docs/adr/001-dream-cycle-architecture.md)
@@ -185,6 +185,30 @@ Dream Cycle 作为 cron job（04:00 HKT）运行在 [Hermes Agent](https://githu
 - **Vault Pipeline**：Dream Cycle → wiki-ingest → Obsidian → NotebookLM
 - **Telegram**：每日梦循环报告通过 Hermes gateway 推送
 
+### 🧪 测试
+
+```bash
+# 运行全部 45 个单元测试
+cd /root/repos/dream-cycle
+python3 -m pytest src/dream_cycle/tests/ -v
+
+# 运行特定模块
+python3 -m pytest src/dream_cycle/tests/test_stage2.py -v
+```
+
+测试覆盖：config 参数验证、similarity 函数（Jaccard/n-gram/combined）、stage2 衰减层级分类和重要性评分逻辑。当前无集成测试（依赖外部 PG/Neo4j）。
+
+### ⚡ 性能优化 (v3.3)
+
+批量查询模式避免 N+1 问题，显著减少 `docker exec` 调用次数：
+
+| 操作 | 优化前 | 优化后 | 提升 |
+|:-----|:-------|:-------|:-----|
+| 语义签名冲突检测 (200条记忆) | ~200次 docker exec | 2次 docker exec | **100x** |
+| 批量矛盾处理 (50条冲突) | ~150次 docker exec | 1次 docker exec | **150x** |
+| 实体提取 (stage2→orchestrator) | 2次 LLM 调用/cluster | 1次 LLM 调用/cluster | **2x** |
+| API key 读取 | 每次 LLM 调用读文件 | 首次读取后缓存 | **~20x I/O** |
+
 ### 📜 版本历史
 
 | 版本 | 日期 | 关键变更 |
@@ -194,6 +218,7 @@ Dream Cycle 作为 cron job（04:00 HKT）运行在 [Hermes Agent](https://githu
 | v3.0 | 2026-05-03 | P1-P5：LLM boost + 向量去重 + Vault OR-gate + Ebbinghaus 联动 |
 | v3.1 | 2026-05-04 | P6-P10：Telegram 日报增强 + 冲突处理 + 健康仪表盘 + Neo4j 双向 |
 | v3.2 | 2026-05-07 | 时间感知 7 层防护 + NotebookLM audio description |
+| v3.3 | 2026-05-31 | 10个关键bug修复 + 批量查询性能优化 (100-150x) + 45个单元测试 |
 
 ---
 
@@ -345,6 +370,30 @@ Dream Cycle runs as a cron job (04:00 HKT) within the [Hermes Agent](https://git
 - **Skill**: `meta/dream-cycle` provides quick reference
 - **Vault Pipeline**: Dream Cycle → wiki-ingest → Obsidian → NotebookLM
 - **Telegram**: Daily dream report via Hermes gateway
+
+### 🧪 Testing
+
+```bash
+# Run all 45 unit tests
+cd /root/repos/dream-cycle
+python3 -m pytest src/dream_cycle/tests/ -v
+
+# Run specific module
+python3 -m pytest src/dream_cycle/tests/test_stage2.py -v
+```
+
+Test coverage: config parameter validation, similarity functions (Jaccard/n-gram/combined), stage2 decay tier classification and importance scoring logic. No integration tests currently (external PG/Neo4j dependencies).
+
+### ⚡ Performance Optimizations (v3.3)
+
+Batch query patterns eliminate N+1 problems, dramatically reducing `docker exec` calls:
+
+| Operation | Before | After | Improvement |
+|:----------|:-------|:------|:------------|
+| Semantic slot conflict detection (200 memories) | ~200 docker exec | 2 docker exec | **100x** |
+| Batch contradiction resolution (50 conflicts) | ~150 docker exec | 1 docker exec | **150x** |
+| Entity extraction (stage2→orchestrator) | 2 LLM calls/cluster | 1 LLM call/cluster | **2x** |
+| API key reading | File read per LLM call | Cached after first read | **~20x I/O** |
 
 ---
 

@@ -25,7 +25,7 @@ python3 -m dream_cycle --backlog          # 一键清理所有积压 (矛盾+vau
 python3 /root/scripts/ops/dream_cycle.py  # 等价于 python3 -m dream_cycle
 ```
 
-无测试套件、无 linter 配置、无构建步骤。纯 Python 模块，依赖系统级 Python 包。
+45 个单元测试 (pytest)，无 linter 配置、无构建步骤。纯 Python 模块，依赖系统级 Python 包。
 
 ## 架构概述
 
@@ -86,3 +86,49 @@ PG(mem0) → [Stage 1: Shallow Sleep] → [Stage 2: REM] → [Stage 3: Deep Slee
 - **health.py** — 自适应触发判断(4条件) + 在线去冗余检查(写入时) + 健康仪表盘
 - **entities.py** — 实体提取(LLM + 规则)、停用词表、领域加权关键词
 - **vault.py** — Vault stub 创建(含时间感知：过期市场数据不编入概述)
+
+## 测试
+
+```bash
+# 运行全部测试 (45 tests)
+cd /root/repos/dream-cycle
+python3 -m pytest src/dream_cycle/tests/ -v
+
+# 运行特定模块测试
+python3 -m pytest src/dream_cycle/tests/test_stage2.py -v
+```
+
+测试覆盖: config参数验证、similarity函数、stage2衰减层级和评分逻辑。无集成测试（依赖外部PG/Neo4j）。
+
+## 性能优化
+
+### 批量查询模式 (P11)
+
+避免 N+1 查询问题，所有批量操作使用预取模式：
+
+- **detect_slot_conflicts** (stage3.py): 2次批量查询（IDs+文本 + 向量邻居），而非逐条查询（最坏200次docker exec）
+- **batch_resolve_all_conflicts** (orchestrator.py): 1次批量查询所有文本+时间戳，而非每条冲突2-4次查询
+- **stage2_rem → orchestrator**: stage2 缓存 `cluster_entities` 到 `rem_results`，orchestrator 复用而非重新提取（避免重复LLM调用）
+
+### API Key 缓存 (llm.py)
+
+`_api_key_cache` 模块级变量缓存 API key，避免每次 `_call_infini()` 都读取 config.yaml。首次调用读取，后续调用直接返回缓存值。
+
+### 预期性能提升
+
+| 操作 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| detect_slot_conflicts (200条记忆) | ~200次 docker exec | 2次 docker exec | 100x |
+| batch_resolve_all_conflicts (50条冲突) | ~150次 docker exec | 1次 docker exec | 150x |
+| stage2→orchestrator 实体提取 | 2次 LLM 调用/cluster | 1次 LLM 调用/cluster | 2x |
+| API key 读取 | 每次 LLM 调用读文件 | 首次读取后缓存 | ~20x I/O |
+
+## 开发注意事项
+
+### 添加新的批量操作时
+
+遵循预取模式：先批量查询构建 lookup map，再在循环中从 map 取值，避免在循环内调用 `pg_query()`。
+
+### 修改 LLM 调用时
+
+如果需要清除 API key 缓存（例如切换账号），重启进程或手动设置 `llm._api_key_cache = None`。

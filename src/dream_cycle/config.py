@@ -5,8 +5,6 @@ All tunable parameters, paths, and shared constants.
 Source of truth for every magic number in the pipeline.
 """
 
-
-
 __all__ = [
     "HKT",
     "PG_CONTAINER",
@@ -60,19 +58,10 @@ __all__ = [
     "log",
 ]
 
-import json
-import hashlib
-import re
-import sqlite3
-import time
 import logging
 import logging.handlers
-import argparse
-import sys
-import math
-from datetime import datetime, timezone, timedelta
+from datetime import timezone, timedelta
 from pathlib import Path
-from collections import defaultdict
 
 # ─── Timezone ──────────────────────────────────────────────────────────
 
@@ -101,9 +90,9 @@ DREAM_LOCK_TIMEOUT = 3600  # 1h timeout (normal run: 15-25 min)
 # ─── Similarity thresholds (cosine distance) ───────────────────────────
 # 0 = identical, 0.5 = orthogonal, 1.0 = opposite
 
-DEDUP_DIST = 0.10          # <0.10 = duplicate (similarity > 0.90)
-MERGE_DIST = 0.18          # 0.10-0.18 = mergeable (similarity 0.82-0.90)
-CLUSTER_DIST = 0.30        # 0.18-0.30 = same group (similarity 0.70-0.82)
+DEDUP_DIST = 0.10  # <0.10 = duplicate (similarity > 0.90)
+MERGE_DIST = 0.18  # 0.10-0.18 = mergeable (similarity 0.82-0.90)
+CLUSTER_DIST = 0.30  # 0.18-0.30 = same group (similarity 0.70-0.82)
 
 # Text similarity thresholds (n-gram fallback, no vector)
 DEDUP_THRESHOLD = 0.92
@@ -113,86 +102,124 @@ CLUSTER_THRESHOLD = 0.70
 # ─── Importance scoring weights (7-dim, v3 + novelty from SCM) ─────────
 
 IMPORTANCE_WEIGHTS = {
-    "recency": 0.12,          # Time decay (FadeMem dual-layer)
-    "frequency": 0.18,        # Short-term signal accumulation
+    "recency": 0.12,  # Time decay (FadeMem dual-layer)
+    "frequency": 0.18,  # Short-term signal accumulation
     "query_diversity": 0.12,  # Different query contexts hit
-    "domain": 0.18,           # Investment > Tech > Daily
-    "consolidation": 0.14,    # Multi-day recurrence strength
-    "confidence": 0.08,       # High confidence bonus
-    "novelty": 0.18,          # Semantic distance from existing memories (SCM core)
+    "domain": 0.18,  # Investment > Tech > Daily
+    "consolidation": 0.14,  # Multi-day recurrence strength
+    "confidence": 0.08,  # High confidence bonus
+    "novelty": 0.18,  # Semantic distance from existing memories (SCM core)
 }
 
 # ─── Adaptive trigger (SCM + SleepGate) ────────────────────────────────
 
-TRIGGER_MAX_IDLE_HOURS = 6       # Force trigger after 6h idle
-TRIGGER_MIN_NEW_MEMORIES = 10    # Trigger if ≥10 new memories
-TRIGGER_CONFLICT_DENSITY = 0.3   # Conflict density threshold (SCM: θ_c=0.3)
-TRIGGER_MEMORY_ENTROPY = 0.9     # Memory entropy threshold (SCM: θ_e=0.9)
+TRIGGER_MAX_IDLE_HOURS = 6  # Force trigger after 6h idle
+TRIGGER_MIN_NEW_MEMORIES = 10  # Trigger if ≥10 new memories
+TRIGGER_CONFLICT_DENSITY = 0.3  # Conflict density threshold (SCM: θ_c=0.3)
+TRIGGER_MEMORY_ENTROPY = 0.9  # Memory entropy threshold (SCM: θ_e=0.9)
 
 # ─── NREM Hebbian parameters (from SCM) ─────────────────────────────────
 
-HEBBIAN_LEARNING_RATE = 0.1     # η: connection strength increment
-HEBBIAN_DOWNSCALE = 0.8         # α: global downscale factor (20%/cycle)
+HEBBIAN_LEARNING_RATE = 0.1  # η: connection strength increment
+HEBBIAN_DOWNSCALE = 0.8  # α: global downscale factor (20%/cycle)
 
 # ─── REM Dream Engine v2 (from claude-brain) ───────────────────────────
 
-REM_WALK_LENGTH = 5              # Random walk steps per seed
-REM_SEED_COUNT = 5               # High-importance seed nodes
-REM_MAX_NEW_EDGES = 10           # Max new edges per dream cycle
-REM_JUMP_PROBABILITY = 0.30      # 30% creative teleport probability
-WAKING_THRESHOLD = 1             # Shared neighbors ≥1 to promote edge
-SHY_PROTECTION_PCT = 0.20        # SHY: top 20% edges protected
-SHY_DOWNSCALE_FACTOR = 0.15      # SHY: max downscale for unprotected
-SHY_PRUNE_THRESHOLD = 0.08       # SHY: prune edges below this
+REM_WALK_LENGTH = 5  # Random walk steps per seed
+REM_SEED_COUNT = 5  # High-importance seed nodes
+REM_MAX_NEW_EDGES = 10  # Max new edges per dream cycle
+REM_JUMP_PROBABILITY = 0.30  # 30% creative teleport probability
+WAKING_THRESHOLD = 1  # Shared neighbors ≥1 to promote edge
+SHY_PROTECTION_PCT = 0.20  # SHY: top 20% edges protected
+SHY_DOWNSCALE_FACTOR = 0.15  # SHY: max downscale for unprotected
+SHY_PRUNE_THRESHOLD = 0.08  # SHY: prune edges below this
 
 # ─── Vault promotion gates (from OpenClaw Dreaming) ────────────────────
 
-PROMOTION_MIN_SCORE = 0.65       # Minimum combined score
-PROMOTION_MIN_RECALLS = 3        # Minimum recall count
-PROMOTION_MIN_SESSIONS = 2       # Minimum cross-session appearances
+PROMOTION_MIN_SCORE = 0.65  # Minimum combined score
+PROMOTION_MIN_RECALLS = 3  # Minimum recall count
+PROMOTION_MIN_SESSIONS = 2  # Minimum cross-session appearances
 
 # ─── Permanent markers (never archive) ─────────────────────────────────
 
-PERMANENT_MARKERS = ['⚠️ PERMANENT', '🔥 HIGH', '📌 PIN']
+PERMANENT_MARKERS = ["⚠️ PERMANENT", "🔥 HIGH", "📌 PIN"]
 
 # ─── FadeMem dual-layer decay: R = e^(-λ·t^β) ────────────────────────
 # β>1 = super-linear fast decay (volatile)
 # β<1 = sub-linear slow decay (stable)
 
 DECAY_HALF_LIVES = {
-    "volatile": 3,    # days — market data
-    "normal": 7,      # days — projects/tools
-    "stable": 30,     # days — user prefs/infra
+    "volatile": 3,  # days — market data
+    "normal": 7,  # days — projects/tools
+    "stable": 30,  # days — user prefs/infra
 }
 FADEMEM_BETA = {
     "volatile": 1.2,  # super-linear: market data fast decay
-    "normal": 1.0,    # linear: standard exponential
-    "stable": 0.8,    # sub-linear: user prefs slow decay
+    "normal": 1.0,  # linear: standard exponential
+    "stable": 0.8,  # sub-linear: user prefs slow decay
 }
 RETENTION_FLOOR = 0.20  # Minimum retention baseline (from PowerMem)
 
 # ─── Archive strategy (from Auto-Dream: never delete, archive) ─────────
 
-ARCHIVE_THRESHOLD_DAYS = 90   # >90d + low importance → archive
-ARCHIVE_MIN_SCORE = 0.25      # Below this score → eligible for archive
+ARCHIVE_THRESHOLD_DAYS = 90  # >90d + low importance → archive
+ARCHIVE_MIN_SCORE = 0.25  # Below this score → eligible for archive
 
 # ─── Session Signal Scanning (from Anthropic autoDream) ────────────────
 
 SIGNAL_CORRECTIONS = [
-    "不对", "错了", "actually", "wrong", "别这样", "stop doing", "不是",
-    "incorrect", "I said", "I meant", "don't do", "correction", "修改",
+    "不对",
+    "错了",
+    "actually",
+    "wrong",
+    "别这样",
+    "stop doing",
+    "不是",
+    "incorrect",
+    "I said",
+    "I meant",
+    "don't do",
+    "correction",
+    "修改",
 ]
 SIGNAL_PREFERENCES = [
-    "我喜欢", "prefer", "always use", "从今以后", "记住", "I like",
-    "I want", "going forward", "keep in mind", "make sure", "我的偏好",
+    "我喜欢",
+    "prefer",
+    "always use",
+    "从今以后",
+    "记住",
+    "I like",
+    "I want",
+    "going forward",
+    "keep in mind",
+    "make sure",
+    "我的偏好",
 ]
 SIGNAL_DECISIONS = [
-    "决定", "我们用", "let's go with", "chosen", "decision", "agreed",
-    "the plan is", "switch to", "move to", "pick", "选定", "方案是",
+    "决定",
+    "我们用",
+    "let's go with",
+    "chosen",
+    "decision",
+    "agreed",
+    "the plan is",
+    "switch to",
+    "move to",
+    "pick",
+    "选定",
+    "方案是",
 ]
 SIGNAL_PATTERNS = [
-    "又是", "每次", "every time", "again", "keep forgetting", "as usual",
-    "same as before", "like last time", "老问题", "反复",
+    "又是",
+    "每次",
+    "every time",
+    "again",
+    "keep forgetting",
+    "as usual",
+    "same as before",
+    "like last time",
+    "老问题",
+    "反复",
 ]
 
 # ─── LLM API (DashScope) ──────────────────────────────────────────────
@@ -218,18 +245,12 @@ log = logging.getLogger("dream")
 
 # ─── Utility functions ─────────────────────────────────────────────────
 
+
 def safe_float(val, default=None) -> float | None:
     """Safe float conversion — PG returns empty strings, don't crash."""
-    if val is None or val == '':
+    if val is None or val == "":
         return default
     try:
         return float(val)
     except (ValueError, TypeError):
         return default
-
-
-def text_hash(text: str) -> str:
-    """Return a 16-char hex digest for deduplication."""
-    import re
-    normalized = re.sub(r'\s+', ' ', text.lower().strip())
-    return hashlib.md5(normalized.encode()).hexdigest()[:16]

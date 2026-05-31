@@ -8,12 +8,12 @@ batch vector clustering, and query–memory matching.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 
 from dream_cycle.config import (
-    DEDUP_DIST, MERGE_DIST, CLUSTER_DIST,
-    DEDUP_THRESHOLD, MERGE_THRESHOLD, CLUSTER_THRESHOLD,
-    safe_float, log,
+    CLUSTER_DIST,
+    safe_float,
 )
 # pg_query imported lazily inside functions that need it
 
@@ -28,9 +28,13 @@ __all__ = [
 ]
 
 
+def text_hash(text: str) -> str:
+    """Return a 16-char hex digest for deduplication."""
+    normalized = re.sub(r"\s+", " ", text.lower().strip())
+    return hashlib.md5(normalized.encode()).hexdigest()[:16]
+
+
 # ─── Text fingerprints & similarity ─────────────────────────────────
-
-
 
 
 def jaccard_similarity(s1: str, s2: str) -> float:
@@ -44,6 +48,7 @@ def jaccard_similarity(s1: str, s2: str) -> float:
 
 def ngram_similarity(s1: str, s2: str, n: int = 3) -> float:
     """Character n-gram similarity (more sensitive than Jaccard)."""
+
     def ngrams(text: str, n: int) -> set[str]:
         return {text[i : i + n] for i in range(len(text) - n + 1)}
 
@@ -73,6 +78,7 @@ def get_vector_neighbors(
     Returns list of ``{"id": str, "text": str, "distance": float}``.
     """
     from dream_cycle.db import pg_query
+
     sql = f"""\
         SELECT b.id::text,
                LEFT(b.payload->>'data', 200) AS text,
@@ -106,6 +112,7 @@ def batch_vector_clustering(
     Returns ``{memory_id: [neighbor_id, ...]}`` (symmetric).
     """
     from dream_cycle.db import pg_query
+
     if len(memory_ids) < 2:
         return {}
 
