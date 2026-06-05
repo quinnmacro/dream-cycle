@@ -6,6 +6,7 @@ __all__ = [
     "stage2_rem",
     "score_importance",
     "classify_decay_tier",
+    "hybrid_recall_score",
 ]
 
 import re
@@ -321,6 +322,10 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
                 sc = 0
 
             s = score_importance(m, recall_count=rc, session_count=sc)
+            # Compute hybrid recall score (50% vec + 30% FTS + 20% importance)
+            h = hybrid_recall_score(m, importance_score=s)
+            m["hybrid_score"] = round(h, 4)
+            m["importance_score"] = round(s, 4)
             scored.append((m, s))
         scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -664,6 +669,71 @@ def stage2_rem(clusters: dict[str, list[dict]], neo4j_connections: dict = None) 
         )
 
     return results
+
+
+# ─── Hybrid Recall Scoring (from Mnemosyne 50/30/20) ─────────────────
+
+
+# Weights for hybrid scoring at recall time
+HYBRID_VEC_WEIGHT = 0.50  # Vector similarity
+HYBRID_FTS_WEIGHT = 0.30  # Text relevance (keyword density)
+HYBRID_IMP_WEIGHT = 0.20  # Importance score (from score_importance)
+
+
+def hybrid_recall_score(
+    memory: dict,
+    query: str = "",
+    importance_score: float = 0.5,
+    vec_similarity: float = 0.5,
+) -> float:
+    """
+    Mnemosyne-style hybrid recall scoring.
+
+    Combines three signals for ranking memories at recall time:
+    - 50% vector similarity (semantic match to query)
+    - 30% FTS/text relevance (keyword density + recency bonus)
+    - 20% importance score (from score_importance 7-dim)
+
+    This can be used to pre-tag memories with a hybrid_score during
+    the dream cycle, improving recall ranking quality.
+
+    Returns: float 0.0-1.0 (higher = more relevant)
+    """
+    text = memory.get("text", "").lower()
+
+    # FTS component: keyword density in memory text
+    fts_score = 0.3  # baseline
+    if query:
+        query_terms = query.lower().split()
+        if query_terms:
+            matches = sum(1 for t in query_terms if t in text)
+            fts_score = min(1.0, matches / max(len(query_terms), 1))
+
+    # Recency bonus for FTS (recent memories get slight boost)
+    try:
+        created = memory.get("created_at", "")
+        if created:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+            # Half-life 7 days for recency bonus
+            recency_bonus = math.exp(-math.log(2) * age_days / 7) * 0.1
+            fts_score = min(1.0, fts_score + recency_bonus)
+    except Exception:
+        pass
+
+    # Tier weight: higher-tier memories get penalized
+    tier = int(memory.get("tier", 1) or 1)
+    from dream_cycle.config import TIER_WEIGHTS
+    tier_multiplier = TIER_WEIGHTS.get(tier, 1.0)
+
+    # Weighted combination
+    raw = (
+        HYBRID_VEC_WEIGHT * vec_similarity
+        + HYBRID_FTS_WEIGHT * fts_score
+        + HYBRID_IMP_WEIGHT * importance_score
+    )
+
+    return raw * tier_multiplier
 
 
 # ─── Stage 3: Deep Sleep (深睡) — 整合行动 ────────────────────────────
