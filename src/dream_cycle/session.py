@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from dream_cycle.config import (
     STATE_DB, HKT,
     SIGNAL_CORRECTIONS, SIGNAL_PREFERENCES, SIGNAL_DECISIONS, SIGNAL_PATTERNS,
+    SIGNAL_IDENTITY,
     log,
 )
 
@@ -77,10 +78,10 @@ def scan_session_signals(hours: int = 72) -> dict:
     Each item: {"text": str, "session_id": str, "timestamp": float, "signal_type": str}
     """
     if not STATE_DB.exists():
-        return {"corrections": [], "preferences": [], "decisions": [], "patterns": []}
+        return {"corrections": [], "preferences": [], "decisions": [], "patterns": [], "identity": []}
     
     cutoff = time.time() - hours * 3600
-    signals = {"corrections": [], "preferences": [], "decisions": [], "patterns": []}
+    signals = {"corrections": [], "preferences": [], "decisions": [], "patterns": [], "identity": []}
     
     try:
         conn = sqlite3.connect(str(STATE_DB))
@@ -137,6 +138,14 @@ def scan_session_signals(hours: int = 72) -> dict:
                 for kw in SIGNAL_PATTERNS:
                     if kw.lower() in text_lower:
                         matched_type = "patterns"
+                        matched_kw = kw
+                        break
+            
+            # Identity signals — lowest priority, checked after patterns
+            if not matched_type:
+                for kw in SIGNAL_IDENTITY:
+                    if kw.lower() in text_lower:
+                        matched_type = "identity"
                         matched_kw = kw
                         break
             

@@ -50,6 +50,7 @@ __all__ = [
     "SIGNAL_PREFERENCES",
     "SIGNAL_DECISIONS",
     "SIGNAL_PATTERNS",
+    "SIGNAL_IDENTITY",
     "ARCHIVE_THRESHOLD_DAYS",
     "ARCHIVE_MIN_SCORE",
     "TIER2_DAYS",
@@ -242,6 +243,40 @@ SIGNAL_PATTERNS = [
     "like last time",
     "老问题",
     "反复",
+]
+
+# ─── Identity Signals (from Mnemosyne _IDENTITY_SIGNALS) ──────────────
+# Expressions where the user voices something about themselves or their
+# relationship to their work. Matched memories get source="identity",
+# importance=0.85, scope="global" — high priority, cross-session durable.
+
+SIGNAL_IDENTITY = [
+    "feeling like",
+    "imposter",
+    "impostor",
+    "barely know",
+    "don't know my own",
+    "don't even know how",
+    "want them to feel",
+    "i'm proud",
+    "i feel like a",
+    "i don't know how to",
+    "我觉得自己",
+    "我不是",
+    "我其实是",
+    "我的身份",
+    "我不配",
+    "我配得上",
+    "我是那种",
+    "我想成为",
+    "我不像",
+    "my identity",
+    "who i am",
+    "what i do",
+    "my role",
+    "my purpose",
+    "i belong",
+    "i don't belong",
 ]
 
 # ─── LLM API (DashScope) ──────────────────────────────────────────────

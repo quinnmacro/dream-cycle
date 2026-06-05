@@ -147,10 +147,14 @@ def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
             f"(纠正={len(signals['corrections'])}, "
             f"偏好={len(signals['preferences'])}, "
             f"决策={len(signals['decisions'])}, "
-            f"模式={len(signals['patterns'])})"
+            f"模式={len(signals['patterns'])}, "
+            f"身份={len(signals.get('identity', []))})"
         )
         for sig_type, sigs in signals.items():
             for sig in sigs[:5]:
+                # Identity signals get higher importance (from Mnemosyne)
+                importance = 0.85 if sig_type == "identity" else 0.5
+                source = "identity" if sig_type == "identity" else "session_signal"
                 memories.append(
                     {
                         "id": f"signal_{sig_type}_{sig['timestamp']:.0f}",
@@ -158,8 +162,9 @@ def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
                         "created_at": datetime.fromtimestamp(
                             sig["timestamp"], tz=timezone.utc
                         ).isoformat(),
-                        "source": "session_signal",
+                        "source": source,
                         "signal_type": sig_type,
+                        "importance": importance,
                         "session_title": sig.get("session_title", ""),
                     }
                 )
