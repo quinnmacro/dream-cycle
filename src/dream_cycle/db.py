@@ -8,6 +8,7 @@ __all__ = [
     "pg_query",
     "get_recent_memories",
     "get_incremental_memories",
+    "claim_memories",
     "update_manifest",
     "mark_manifest_archived",
     "get_all_memories_with_embeddings",
@@ -136,7 +137,8 @@ def init_dream_db():
             last_processed_at TEXT NOT NULL,
             process_count INTEGER DEFAULT 1,
             last_dream_run_id INTEGER,
-            status TEXT DEFAULT 'active'
+            status TEXT DEFAULT 'active',
+            consolidated_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_manifest_hash ON processed_manifest(memory_hash);
         CREATE INDEX IF NOT EXISTS idx_manifest_status ON processed_manifest(status);
@@ -251,6 +253,67 @@ def get_incremental_memories(hours: int = 48) -> list[dict]:
         f"(已处理 {len(all_recent) - len(new_memories)})"
     )
     return new_memories
+
+
+def claim_memories(
+    memory_ids: list[str],
+    dream_run_id: int,
+    conn: sqlite3.Connection | None = None,
+) -> list[str]:
+    """
+    Atomic claim pattern (from Mnemosyne sleep consolidation).
+
+    Mark memories as claimed by this dream run, preventing concurrent
+    dream cycles from processing the same memories.
+
+    Uses UPDATE WHERE consolidated_at IS NULL — only unclaimed rows
+    are affected. Returns the list of successfully claimed IDs.
+
+    This is defense-in-depth on top of the PID lock: if two processes
+    somehow bypass the lock, the SQL claim prevents double-processing.
+    """
+    if not memory_ids:
+        return []
+
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(str(DREAM_DB), timeout=5.0)
+
+    now = datetime.now(HKT).isoformat()
+    claimed = []
+
+    try:
+        # Ensure column exists (migration for existing DBs)
+        try:
+            conn.execute(
+                "ALTER TABLE processed_manifest ADD COLUMN consolidated_at TEXT"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        for mid in memory_ids:
+            cursor = conn.execute(
+                """UPDATE processed_manifest
+                   SET consolidated_at = ?, last_dream_run_id = ?
+                   WHERE memory_id = ? AND consolidated_at IS NULL""",
+                (now, dream_run_id, mid),
+            )
+            if cursor.rowcount > 0:
+                claimed.append(mid)
+
+        conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+
+    if len(claimed) < len(memory_ids):
+        log.info(
+            f"  🔒 Atomic claim: {len(claimed)}/{len(memory_ids)} claimed "
+            f"({len(memory_ids) - len(claimed)} already claimed by concurrent run)"
+        )
+
+    return claimed
 
 
 def update_manifest(memories: list[dict], dream_run_id: int):

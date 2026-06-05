@@ -31,6 +31,7 @@ from dream_cycle.db import (
     pg_query,
     get_recent_memories,
     get_incremental_memories,
+    claim_memories,
     update_manifest,
     mark_manifest_archived,
     write_relations_to_neo4j,
@@ -288,6 +289,12 @@ def _finalize_run(
     if memories and not dry_run:
         update_manifest(memories, dream_run_id)
         log.info(f"  📋 Manifest 已更新: {len(memories)} 条标记为已处理")
+
+        # Atomic claim: prevent concurrent dream cycles from re-processing
+        memory_ids = [m["id"] for m in memories]
+        claimed = claim_memories(memory_ids, dream_run_id)
+        if len(claimed) < len(memory_ids):
+            log.info(f"  🔒 Atomic claim: {len(claimed)}/{len(memory_ids)} claimed")
 
         archived_ids = [
             item["remove"]["id"] for item in rem_results.get("dedup_candidates", [])
