@@ -58,17 +58,23 @@ def _get_infini_api_key() -> str:
 
 
 def _call_infini(
-    prompt: str, max_tokens: int = 300, temperature: float = 0.3
+    prompt: str, max_tokens: int = 300, temperature: float = 0.3,
+    system: str = "",
 ) -> str | None:
     """调用 DashScope API (qwen3.7-max) 的通用函数"""
     api_key = _get_infini_api_key()
     if not api_key:
         return None
 
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
     payload = json.dumps(
         {
             "model": INFINI_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "enable_thinking": False,  # 不需要推理，节省 tokens 和延迟
