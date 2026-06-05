@@ -275,6 +275,20 @@ def _execute_stages(
             stats["slot_conflicts"] = len(slot_conflicts)
             rem_results["slot_conflicts_list"] = slot_conflicts
 
+    # SHMR: Self-Harmonizing Memory Reasoning (from Mnemosyne)
+    if "3" in stages:
+        from dream_cycle.shmr import run_shmr
+        shmr_stats = run_shmr(memories, dream_run_id, dry_run=dry_run)
+        stats["shmr_beliefs"] = shmr_stats.get("beliefs_created", 0)
+        stats["shmr_dampened"] = shmr_stats.get("contradictions_dampened", 0)
+
+    # Three-tier degradation (from Mnemosyne BEAM)
+    if "3" in stages and not dry_run:
+        from dream_cycle.stage3 import degrade_tiers
+        tier_stats = degrade_tiers(dry_run=dry_run)
+        stats["tier1_to_tier2"] = tier_stats.get("tier1_to_tier2", 0)
+        stats["tier2_to_tier3"] = tier_stats.get("tier2_to_tier3", 0)
+
     return clusters, rem_results, stats, dream_walk_edges
 
 
