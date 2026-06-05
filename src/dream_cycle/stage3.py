@@ -6,6 +6,7 @@ __all__ = [
     "stage3_deep_sleep",
     "detect_slot_conflicts",
     "resolve_slot_conflicts",
+    "degrade_tiers",
 ]
 
 import sqlite3
@@ -14,6 +15,11 @@ from dream_cycle.config import (
     DREAM_DB,
     HKT,
     PERMANENT_MARKERS,
+    TIER2_DAYS,
+    TIER3_DAYS,
+    DEGRADE_BATCH_SIZE,
+    TIER2_MAX_CHARS,
+    TIER3_MAX_CHARS,
     log,
     safe_float,
 )
@@ -649,3 +655,138 @@ def resolve_slot_conflicts(
 
 
 # ─── 报告生成 ──────────────────────────────────────────────────────────
+
+
+def degrade_tiers(dry_run: bool = False) -> dict:
+    """
+    Three-tier degradation for episodic memories (from Mnemosyne BEAM).
+
+    Tier 1 (0-TIER2_DAYS): Full detail, 1.0x recall weight
+    Tier 2 (TIER2_DAYS-TIER3_DAYS): LLM-summarized (≤TIER2_MAX_CHARS), 0.5x weight
+    Tier 3 (TIER3_DAYS+): Text-extracted key entities (≤TIER3_MAX_CHARS), 0.25x weight
+
+    Each tier transition compresses content and tags with degradation tier.
+    Original content preserved in `pre_degradation_text` metadata field.
+
+    Returns stats dict with tier transition counts.
+    """
+    from dream_cycle.llm import _call_infini
+
+    log.info(f"📉 Tier Degradation{' (dry-run)' if dry_run else ''}")
+    stats = {"tier1_to_tier2": 0, "tier2_to_tier3": 0, "errors": 0}
+
+    now = datetime.now(HKT)
+
+    # ── Tier 1 → Tier 2: LLM summarize ──
+    tier2_cutoff = (now - __import__("datetime").timedelta(days=TIER2_DAYS)).isoformat()
+    tier1_query = f"""
+        SELECT id, payload->>'data' as text, payload->>'dream_tier' as tier
+        FROM mem0
+        WHERE payload->>'data' IS NOT NULL
+          AND (payload->>'dream_tier' IS NULL OR payload->>'dream_tier' = '1')
+          AND created_at < '{tier2_cutoff}'
+        ORDER BY created_at ASC
+        LIMIT {DEGRADE_BATCH_SIZE}
+    """
+    tier1_rows = pg_query(tier1_query)
+    log.info(f"  Tier 1→2 candidates: {len(tier1_rows)}")
+
+    for row in tier1_rows:
+        mid = row[0] if len(row) > 0 else ""
+        text = row[1] if len(row) > 1 else ""
+        if not text or len(text) < 100:
+            continue  # Too short to summarize
+
+        if dry_run:
+            stats["tier1_to_tier2"] += 1
+            continue
+
+        # LLM summarize
+        summary = None
+        if len(text) > 300:
+            prompt = (
+                f"Summarize this memory in ≤{TIER2_MAX_CHARS} characters. "
+                f"Keep key facts, numbers, entities. Drop boilerplate.\n\n"
+                f"Memory: {text[:2000]}"
+            )
+            try:
+                summary = _call_infini(prompt, max_tokens=200, temperature=0.2)
+                if summary and len(summary) > 20:
+                    summary = summary[:TIER2_MAX_CHARS]
+            except Exception as e:
+                log.debug(f"  Tier1→2 LLM failed for {mid[:8]}: {e}")
+                stats["errors"] += 1
+
+        if not summary:
+            # Fallback: truncate at sentence boundary
+            summary = text[:TIER2_MAX_CHARS]
+            last_period = summary.rfind(".")
+            if last_period > TIER2_MAX_CHARS // 2:
+                summary = summary[: last_period + 1]
+
+        # Update PG: set degraded text + tier metadata
+        escaped_summary = summary.replace("'", "''").replace("\n", " ")
+        escaped_original = text.replace("'", "''").replace("\n", " ")[:500]
+        pg_query(
+            f"""UPDATE mem0 SET payload = payload
+                || '{{"dream_tier": "2", "degraded_at": "{now.isoformat()}", "pre_degradation_text": "{escaped_original}"}}'
+                || jsonb_set(payload, '{{data}}', '"{escaped_summary}"')
+            WHERE id::text = '{mid}'"""
+        )
+        stats["tier1_to_tier2"] += 1
+
+    # ── Tier 2 → Tier 3: Text extraction (keep key entities) ──
+    tier3_cutoff = (now - __import__("datetime").timedelta(days=TIER3_DAYS)).isoformat()
+    tier2_query = f"""
+        SELECT id, payload->>'data' as text, payload->>'dream_tier' as tier
+        FROM mem0
+        WHERE payload->>'dream_tier' = '2'
+          AND created_at < '{tier3_cutoff}'
+        ORDER BY created_at ASC
+        LIMIT {DEGRADE_BATCH_SIZE // 2}
+    """
+    tier2_rows = pg_query(tier2_query)
+    log.info(f"  Tier 2→3 candidates: {len(tier2_rows)}")
+
+    for row in tier2_rows:
+        mid = row[0] if len(row) > 0 else ""
+        text = row[1] if len(row) > 1 else ""
+        if not text or len(text) < 30:
+            continue
+
+        if dry_run:
+            stats["tier2_to_tier3"] += 1
+            continue
+
+        # Text extraction: keep sentences with numbers/entities, drop the rest
+        import re
+        sentences = re.split(r'(?<=[.。!?])\s+', text)
+        key_sentences = []
+        remaining = TIER3_MAX_CHARS
+        for s in sentences:
+            # Prioritize sentences with numbers, proper nouns, or technical terms
+            has_number = bool(re.search(r'\d', s))
+            has_caps = bool(re.search(r'[A-Z]{2,}', s))
+            is_short = len(s) < 80
+            if (has_number or has_caps or is_short) and len(s) <= remaining:
+                key_sentences.append(s)
+                remaining -= len(s)
+            if remaining <= 0:
+                break
+
+        extracted = " ".join(key_sentences)[:TIER3_MAX_CHARS] if key_sentences else text[:TIER3_MAX_CHARS]
+
+        escaped_extracted = extracted.replace("'", "''").replace("\n", " ")
+        pg_query(
+            f"""UPDATE mem0 SET payload = payload
+                || '{{"dream_tier": "3", "degraded_at": "{now.isoformat()}"}}'
+                || jsonb_set(payload, '{{data}}', '"{escaped_extracted}"')
+            WHERE id::text = '{mid}'"""
+        )
+        stats["tier2_to_tier3"] += 1
+
+    log.info(
+        f"  📉 Tier Degradation: {stats['tier1_to_tier2']} (T1→T2) + "
+        f"{stats['tier2_to_tier3']} (T2→T3) | errors={stats['errors']}"
+    )
+    return stats

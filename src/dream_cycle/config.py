@@ -52,6 +52,12 @@ __all__ = [
     "SIGNAL_PATTERNS",
     "ARCHIVE_THRESHOLD_DAYS",
     "ARCHIVE_MIN_SCORE",
+    "TIER2_DAYS",
+    "TIER3_DAYS",
+    "DEGRADE_BATCH_SIZE",
+    "TIER2_MAX_CHARS",
+    "TIER3_MAX_CHARS",
+    "TIER_WEIGHTS",
     "INFINI_BASE_URL",
     "INFINI_MODEL",
     "safe_float",
@@ -164,6 +170,22 @@ RETENTION_FLOOR = 0.20  # Minimum retention baseline (from PowerMem)
 
 ARCHIVE_THRESHOLD_DAYS = 90  # >90d + low importance → archive
 ARCHIVE_MIN_SCORE = 0.25  # Below this score → eligible for archive
+
+# ─── Three-tier Degradation (from Mnemosyne BEAM) ────────────────────
+# Tier 1 (0-TIER2_DAYS): Full detail, 1.0x recall weight
+# Tier 2 (TIER2_DAYS-TIER3_DAYS): LLM-summarized (≤400 chars), 0.5x weight
+# Tier 3 (TIER3_DAYS+): Text-extracted (≤200 chars), 0.25x weight
+
+TIER2_DAYS = 30  # Age threshold for Tier 1 → Tier 2 degradation
+TIER3_DAYS = 180  # Age threshold for Tier 2 → Tier 3 degradation
+DEGRADE_BATCH_SIZE = 100  # Max memories to degrade per run
+TIER2_MAX_CHARS = 400  # Tier 2 LLM summary max length
+TIER3_MAX_CHARS = 200  # Tier 3 text extraction max length
+TIER_WEIGHTS = {
+    1: 1.0,  # Full detail
+    2: 0.5,  # LLM summarized
+    3: 0.25,  # Text extracted
+}
 
 # ─── Session Signal Scanning (from Anthropic autoDream) ────────────────
 
