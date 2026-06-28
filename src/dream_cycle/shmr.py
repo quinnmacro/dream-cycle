@@ -42,6 +42,10 @@ SHMR_CONFIDENCE_MID = 0.6  # Reasonable inference
 SHMR_CONFIDENCE_LOW = 0.4  # Speculative
 SHMR_DAMPEN_FACTOR = 0.3  # Reduce confidence of contradicted facts
 
+# P3-1: Associative Recall — pull similar archived memories from PG archive
+RECALL_K = 10  # max number of archived memories to recall per night
+RECALL_SIMILARITY_THRESHOLD = 0.55  # Jaccard similarity cutoff for recall candidates
+
 # ─── Schema ────────────────────────────────────────────────────────────
 
 SHMR_SCHEMA_SQL = """
@@ -204,6 +208,85 @@ def _harmonize_cluster(cluster: List[Dict], cluster_id: str) -> List[Dict]:
         return []
 
 
+# ─── P3-1: Associative Recall ────────────────────────────────────────────
+
+def _fetch_archived_memories(limit: int = 50) -> List[Dict]:
+    """Fetch recently archived (but not deleted) memories from PG.
+
+    These are memories that were archived by dedup/decay but still exist
+    in PG with archived=true. We pull them as recall candidates.
+    """
+    try:
+        rows = pg_query(
+            f"""SELECT id::text, payload->>'data' as text, payload->>'created_at' as created_at
+            FROM mem0
+            WHERE payload->>'archived' = 'true'
+            AND payload->>'data' IS NOT NULL
+            AND length(payload->>'data') > 20
+            ORDER BY payload->>'archived_at' DESC NULLS LAST
+            LIMIT {limit}"""
+        )
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "text": row[1] or "",
+                "created_at": row[2] or "",
+                "_recalled": True,  # mark as recalled (never enters val/test)
+            })
+        return result
+    except Exception as e:
+        log.debug(f"SHMR recall: PG query failed: {e}")
+        return []
+
+
+def recall_similar(
+    new_memories: List[Dict],
+    k: int = RECALL_K,
+) -> List[Dict]:
+    """Pull k most-similar archived memories into tonight's clustering pool.
+
+    Ported from SkillOpt-Sleep dream.py recall_similar():
+    - Lexical similarity (Jaccard token overlap), no embeddings needed
+    - Recalled memories marked with _recalled=True (never enter val/test)
+    - Excludes memories already in the candidate set
+
+    Returns list of recalled memory dicts (may be empty).
+    """
+    if not new_memories:
+        return []
+
+    # Fetch archived candidates
+    archived = _fetch_archived_memories(limit=50)
+    if not archived:
+        return []
+
+    # Build a set of existing IDs to exclude
+    existing_ids = {m.get("id", "") for m in new_memories}
+
+    # Score each archived memory by max Jaccard similarity to any new memory
+    scored = []
+    for arc in archived:
+        if arc["id"] in existing_ids:
+            continue
+        arc_text = arc.get("text", "")
+        if len(arc_text) < 20:
+            continue
+        # Find best match among new memories
+        best_sim = 0.0
+        for nm in new_memories:
+            sim = combined_similarity(nm.get("text", ""), arc_text)
+            best_sim = max(best_sim, sim)
+        if best_sim >= RECALL_SIMILARITY_THRESHOLD:
+            scored.append((best_sim, arc))
+
+    # Sort by similarity descending, take top k
+    scored.sort(key=lambda x: -x[0])
+    recalled = [arc for _, arc in scored[:k]]
+
+    return recalled
+
+
 def run_shmr(
     memories: List[Dict],
     dream_run_id: int,
@@ -232,6 +315,14 @@ def run_shmr(
     if len(candidates) < SHMR_MIN_CLUSTER_SIZE:
         log.info(f"  ⏭ SHMR: 候选记忆太少 ({len(candidates)} < {SHMR_MIN_CLUSTER_SIZE})")
         return stats
+
+    # P3-1: Associative Recall — pull similar archived memories from PG
+    # into the clustering pool. This helps SHMR find cross-time patterns.
+    recalled = recall_similar(candidates, k=RECALL_K)
+    if recalled:
+        stats["recalled"] = len(recalled)
+        candidates.extend(recalled)
+        log.info(f"  🔗 Recall: +{len(recalled)} similar archived memories → {len(candidates)} total")
 
     # Cluster
     clusters = _cluster_by_similarity(candidates, SHMR_SIMILARITY_THRESHOLD)

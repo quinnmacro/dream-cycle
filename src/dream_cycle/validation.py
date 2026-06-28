@@ -259,3 +259,102 @@ def quick_validate(
         details=details,
         reason="; ".join(reason_parts),
     )
+
+
+# ─── P3-2: Gate Safety Probe ────────────────────────────────────────────
+
+# Ported from SkillOpt-Sleep: inject a known-bad "harmful edit" and assert
+# the validation gate rejects it. This is a regression test that proves the
+# safety mechanism actually works.
+#
+# The probe simulates removing a high-similarity neighbor of a val memory,
+# which SHOULD degrade the val query's search quality. If the gate doesn't
+# catch this, the safety mechanism is broken.
+
+_PROBE_CORRUPTED_TEXT = (
+    "__HARMFUL__ This memory has been deliberately corrupted by the safety probe. "
+    "If this text appears in search results, the validation gate has FAILED to "
+    "protect memory quality. This is a canary — do not act on this content."
+)
+
+
+def safety_probe(
+    val_memories: list[dict],
+    all_memories: list[dict],
+    *,
+    hard_threshold: float = 0.75,
+) -> dict:
+    """Inject a known-bad edit and assert the gate rejects it.
+
+    Strategy:
+    1. Pick a val memory that has at least one similar neighbor in all_memories
+    2. Simulate removing that neighbor (archived_ids = {neighbor_id})
+    3. Run quick_validate — the gate SHOULD reject (because we removed a useful neighbor)
+    4. If gate rejects → probe PASSED (safety mechanism works)
+    5. If gate accepts → probe FAILED (safety mechanism is broken!)
+
+    Returns:
+        {"passed": bool, "reason": str, "probe_memory_id": str}
+    """
+    if not val_memories or not all_memories:
+        return {"passed": True, "reason": "skipped: no val/test memories", "probe_memory_id": ""}
+
+    # Find a val memory with a good neighbor
+    probe_target = None
+    probe_neighbor = None
+
+    for vm in val_memories[:20]:
+        vm_text = vm.get("text", "")
+        if len(vm_text) < 20:
+            continue
+        # Find most similar non-val memory
+        best_sim = 0.0
+        best_neighbor = None
+        for am in all_memories:
+            if am["id"] == vm["id"]:
+                continue
+            if am.get("_split") == "val":
+                continue
+            sim = combined_similarity(vm_text, am.get("text", ""))
+            if sim > best_sim:
+                best_sim = sim
+                best_neighbor = am
+        if best_neighbor and best_sim >= 0.40:
+            probe_target = vm
+            probe_neighbor = best_neighbor
+            break
+
+    if not probe_target or not probe_neighbor:
+        return {
+            "passed": True,
+            "reason": "skipped: no val memory with a similar neighbor (threshold 0.40)",
+            "probe_memory_id": "",
+        }
+
+    # Simulate removing the neighbor
+    archived_ids = {probe_neighbor["id"]}
+    result = quick_validate(
+        [probe_target],
+        archived_ids,
+        set(),  # no merged
+        all_memories,
+    )
+
+    # The gate should REJECT this removal (because we removed a useful neighbor)
+    # If result.accepted == False → probe PASSED (gate caught the bad edit)
+    # If result.accepted == True → probe FAILED (gate missed it!)
+    probe_passed = not result.accepted
+
+    return {
+        "passed": probe_passed,
+        "reason": (
+            f"gate rejected removal of {probe_neighbor['id'][:8]} "
+            f"(sim={combined_similarity(probe_target['text'], probe_neighbor['text']):.3f})"
+            if probe_passed
+            else f"⚠️ GATE FAILED: accepted removal of {probe_neighbor['id'][:8]} "
+                 f"(hard={result.hard_score:.2f}, val_query={probe_target['id'][:8]})"
+        ),
+        "probe_memory_id": probe_neighbor["id"],
+        "hard_score": result.hard_score,
+        "soft_score": result.soft_score,
+    }

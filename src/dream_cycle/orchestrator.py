@@ -60,7 +60,7 @@ from dream_cycle.shmr import contrastive_beliefs
 from dream_cycle.split import split_memories, get_val_memories, split_stats
 from dream_cycle.budget import EditBudget, COSTLY_OPS
 from dream_cycle.staging import StagingBuffer, adopt_staging, latest_staging, staging_status
-from dream_cycle.validation import quick_validate
+from dream_cycle.validation import quick_validate, safety_probe
 
 import dream_cycle.db as _db_module  # for monkey-patching PG writes
 
@@ -561,6 +561,15 @@ def _execute_stages(
             log.info(f"  {gate_icon} Validation: {validation_result.reason}")
         else:
             log.info("  ℹ️ Validation skipped (no val memories or no removals)")
+
+        # P3-2: Safety probe — prove the gate actually works
+        if val_mems:
+            probe_result = safety_probe(val_mems, memories)
+            staging_info["safety_probe"] = probe_result
+            probe_icon = "🛡️" if probe_result["passed"] else "🚨"
+            log.info(f"  {probe_icon} Safety probe: {probe_result['reason']}")
+            if not probe_result["passed"]:
+                log.warning("  🚨 SAFETY PROBE FAILED — validation gate may be broken!")
 
         # Write staging files (always, even if validation fails — for review)
         staging_result = staging_buffer.write_staging(
