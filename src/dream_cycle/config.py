@@ -279,10 +279,36 @@ SIGNAL_IDENTITY = [
     "i don't belong",
 ]
 
+# ─── Feedback Signals (v6 P1: SkillOpt-inspired outcome detection) ─────
+# Positive feedback: user confirmed agent did well
+FEEDBACK_POSITIVE = [
+    "thanks", "thank you", "perfect", "exactly", "great", "nice",
+    "谢谢", "对了", "没错", "完美", "好的", "可以", "就这样",
+    "awesome", "love it", "spot on", "well done", "good job",
+    "exactly what i", "that's right", "correct",
+]
+# Negative feedback: user expressed dissatisfaction
+FEEDBACK_NEGATIVE = [
+    "wrong", "no that's", "not what i", "bad", "terrible", "useless",
+    "不对", "错了", "不是这样", "胡说", "瞎说", "没用", "垃圾",
+    "try again", "do it again", "redo", "that's not", "i said not",
+    "broken", "doesn't work", "still broken", "fix this",
+    "你又", "又来了", "每次都", "老毛病",
+]
+# Satisfaction-weighted importance modifiers
+FEEDBACK_POS_IMPORTANCE_BOOST = 0.15   # +15% importance for memories near positive feedback
+FEEDBACK_NEG_IMPORTANCE_BOOST = 0.25   # +25% importance for memories near negative feedback (corrections matter more)
+
 # ─── LLM API (DashScope) ──────────────────────────────────────────────
 
 INFINI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 INFINI_MODEL = "qwen3.7-max"
+# P1-4: Dual-backend — cheap model for mining, expensive for consolidation
+INFINI_MODEL_QUICK = "qwen3.7-flash"  # 10x cheaper, good for simple tasks
+
+# P1-3: LLM response cache
+LLM_CACHE_DB = Path("/root/data/llm_cache.db")
+LLM_CACHE_TTL_HOURS = 24  # Cache entries expire after 24h
 
 # ─── Logging ───────────────────────────────────────────────────────────
 

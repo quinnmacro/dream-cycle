@@ -1,24 +1,108 @@
 """
 Dream Cycle — LLM API calls — DashScope (qwen3.7-max) for merge/verify/entity extraction
+
+v6 P1 upgrades:
+  - P1-3: SHA256(prompt) SQLite response cache (24h TTL)
+  - P1-4: Dual-backend — call_quick() for mining, call_deep() for consolidation
 """
 
 __all__ = [
     "call_llm",
+    "call_quick",
+    "call_deep",
     "llm_merge_memories",
     "llm_verify_contradiction",
     "llm_extract_entities",
 ]
 
+import hashlib
 import json
+import sqlite3
 import subprocess
+import time
+from pathlib import Path
 from dream_cycle.config import (
     INFINI_BASE_URL,
     INFINI_MODEL,
+    INFINI_MODEL_QUICK,
+    LLM_CACHE_DB,
+    LLM_CACHE_TTL_HOURS,
     log,
 )
 
 # P11: cache API key to avoid reading config file on every call
 _api_key_cache: str | None = None
+
+# P1-3: LLM response cache — module-level DB connection
+_cache_conn: sqlite3.Connection | None = None
+
+
+def _get_cache_conn() -> sqlite3.Connection:
+    """Get or create the LLM cache SQLite connection."""
+    global _cache_conn
+    if _cache_conn is not None:
+        return _cache_conn
+    LLM_CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(LLM_CACHE_DB), timeout=5.0)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_cache (
+            prompt_hash TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            response TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            hits INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_created ON llm_cache(created_at)")
+    conn.commit()
+    _cache_conn = conn
+    return conn
+
+
+def _cache_get(prompt: str, model: str) -> str | None:
+    """Check cache for a response. Returns cached response or None."""
+    try:
+        conn = _get_cache_conn()
+        prompt_hash = hashlib.sha256(f"{model}:{prompt}".encode()).hexdigest()[:24]
+        cutoff = time.time() - LLM_CACHE_TTL_HOURS * 3600
+        row = conn.execute(
+            "SELECT response FROM llm_cache WHERE prompt_hash=? AND created_at>?",
+            (prompt_hash, cutoff),
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE llm_cache SET hits=hits+1 WHERE prompt_hash=?", (prompt_hash,))
+            conn.commit()
+            return row[0]
+    except Exception:
+        pass
+    return None
+
+
+def _cache_put(prompt: str, model: str, response: str):
+    """Store a response in cache."""
+    try:
+        conn = _get_cache_conn()
+        prompt_hash = hashlib.sha256(f"{model}:{prompt}".encode()).hexdigest()[:24]
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (prompt_hash, model, response, created_at, hits) VALUES (?,?,?,?,0)",
+            (prompt_hash, model, response, time.time()),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _cache_stats() -> dict:
+    """Return cache statistics."""
+    try:
+        conn = _get_cache_conn()
+        total = conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0]
+        cutoff = time.time() - LLM_CACHE_TTL_HOURS * 3600
+        active = conn.execute("SELECT COUNT(*) FROM llm_cache WHERE created_at>?", (cutoff,)).fetchone()[0]
+        total_hits = conn.execute("SELECT COALESCE(SUM(hits),0) FROM llm_cache").fetchone()[0]
+        return {"total": total, "active": active, "total_hits": total_hits}
+    except Exception:
+        return {"total": 0, "active": 0, "total_hits": 0}
 
 
 def _get_infini_api_key() -> str:
@@ -59,9 +143,18 @@ def _get_infini_api_key() -> str:
 
 def _call_infini(
     prompt: str, max_tokens: int = 300, temperature: float = 0.3,
-    system: str = "",
+    system: str = "", model: str = "",
 ) -> str | None:
-    """调用 DashScope API (qwen3.7-max) 的通用函数"""
+    """调用 DashScope API 的通用函数 (with P1-3 cache + P1-4 model routing)"""
+    if not model:
+        model = INFINI_MODEL
+
+    # P1-3: Check cache first
+    cached = _cache_get(prompt, model)
+    if cached is not None:
+        log.debug(f"  💾 LLM cache hit ({model})")
+        return cached
+
     api_key = _get_infini_api_key()
     if not api_key:
         return None
@@ -73,7 +166,7 @@ def _call_infini(
 
     payload = json.dumps(
         {
-            "model": INFINI_MODEL,
+            "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -81,7 +174,7 @@ def _call_infini(
         }
     )
 
-    auth_header = "Authorization: Bearer " + api_key
+    auth_header = f"Authorization: Bearer {api_key}"
     try:
         result = subprocess.run(
             [
@@ -101,10 +194,38 @@ def _call_infini(
         )
         resp = json.loads(result.stdout)
         content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return content.strip() if content else None
+        content = content.strip() if content else None
+
+        # P1-3: Store in cache
+        if content:
+            _cache_put(prompt, model, content)
+
+        return content
     except Exception as e:
         log.warning(f"⚠️ Infini API 调用失败: {e}")
         return None
+
+
+def call_llm(prompt: str, max_tokens: int = 300, temperature: float = 0.3, system: str = "") -> str | None:
+    """Standard LLM call (uses default model = qwen3.7-max)."""
+    return _call_infini(prompt, max_tokens=max_tokens, temperature=temperature, system=system)
+
+
+def call_quick(prompt: str, max_tokens: int = 200, temperature: float = 0.3, system: str = "") -> str | None:
+    """P1-4: Quick/cheap LLM call — uses flash model for mining/simple tasks.
+
+    Use for: session mining, entity extraction, simple classification.
+    ~10x cheaper than call_deep().
+    """
+    return _call_infini(prompt, model=INFINI_MODEL_QUICK, max_tokens=max_tokens, temperature=temperature, system=system)
+
+
+def call_deep(prompt: str, max_tokens: int = 1024, temperature: float = 0.3, system: str = "") -> str | None:
+    """P1-4: Deep/expensive LLM call — uses max model for consolidation/analysis.
+
+    Use for: SHMR harmonization, contrastive reflection, merge, contradiction verification.
+    """
+    return _call_infini(prompt, model=INFINI_MODEL, max_tokens=max_tokens, temperature=temperature, system=system)
 
 
 def llm_merge_memories(texts: list[str]) -> str | None:

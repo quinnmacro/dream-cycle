@@ -14,6 +14,7 @@ confidence scores and provenance chains.
 
 __all__ = [
     "run_shmr",
+    "contrastive_beliefs",
 ]
 
 import json
@@ -309,5 +310,204 @@ def run_shmr(
         f"  📊 SHMR 完成: {stats['clusters_formed']} clusters → "
         f"{stats['beliefs_created']} new + {stats['beliefs_updated']} updated + "
         f"{stats['contradictions_dampened']} dampened beliefs"
+    )
+    return stats
+
+
+# ─── P1-2: Contrastive Reflection (SkillOpt-inspired) ────────────────
+# Ported from SkillOpt-Sleep rollout.py contrastive_reflect():
+# "What did the good attempts do that the bad ones didn't?"
+#
+# For SHMR: find memories where the same topic/entity appeared in both
+# successful and failed sessions. Extract the decisive factors.
+
+CONTRASTIVE_PROMPT = """You are a contrastive analyst. These memories all relate to the same topic or entity, but some come from sessions where the user was satisfied and some from sessions where the user was frustrated or corrected the agent.
+
+Your job: identify what distinguishes the GOOD outcomes from the BAD ones.
+
+**Good outcomes (user satisfied):**
+{good_memories}
+
+**Bad outcomes (user corrected/frustrated):**
+{bad_memories}
+
+Find 1-3 decisive factors — what made the difference?
+Output as JSON array:
+[{{"factor": "one-sentence description of the decisive factor",
+  "evidence_good": "what good outcomes did",
+  "evidence_bad": "what bad outcomes did differently",
+  "confidence": 0.0-1.0,
+  "actionable": true/false}}]
+
+RULES:
+- Focus on concrete behavioral differences, not vague generalizations
+- "actionable" = can we encode this as a rule for future sessions?
+- Confidence 0.8+ = clear pattern across multiple examples
+- Confidence <0.5 = speculative, based on few examples
+- Output 1-3 factors maximum"""
+
+
+def contrastive_beliefs(
+    memories: List[Dict],
+    session_outcomes: Dict[str, str],
+    dream_run_id: int,
+    dry_run: bool = False,
+) -> Dict:
+    """Run contrastive reflection on memories grouped by session outcome.
+
+    Ported from SkillOpt-Sleep: finds topics that appeared in both
+    successful and failed sessions, extracts what made the difference.
+
+    Args:
+        memories: List of memory dicts (must have 'session_id' or source info)
+        session_outcomes: {session_id: 'success'|'fail'|'mixed'|'unknown'}
+        dream_run_id: Current dream run ID for provenance
+        dry_run: If True, only analyze without LLM calls
+
+    Returns stats dict.
+    """
+    stats = {
+        "contrastive_clusters": 0,
+        "factors_extracted": 0,
+        "actionable_rules": 0,
+    }
+
+    # Group memories by topic (entity/title prefix) and outcome
+    # Use first 30 chars of text as a rough topic key
+    topic_groups: Dict[str, Dict[str, List[Dict]]] = {}  # topic → {"good": [...], "bad": [...]}
+
+    for mem in memories:
+        text = mem.get("text", "")
+        if len(text) < 20:
+            continue
+
+        # Get session outcome for this memory
+        session_id = mem.get("session_id", "")
+        outcome = session_outcomes.get(session_id, "unknown")
+        if outcome == "unknown":
+            continue  # Skip memories without clear outcomes
+
+        # Use topic keywords (first meaningful noun phrase) as grouping key
+        topic_key = text[:40].strip().lower()
+        # Remove common prefixes to improve grouping
+        for prefix in ["user prefers", "user corrected", "[session_", "the user"]:
+            if topic_key.startswith(prefix):
+                topic_key = topic_key[len(prefix):].strip()
+
+        if topic_key not in topic_groups:
+            topic_groups[topic_key] = {"good": [], "bad": []}
+
+        if outcome == "success":
+            topic_groups[topic_key]["good"].append(mem)
+        elif outcome == "fail":
+            topic_groups[topic_key]["bad"].append(mem)
+
+    # Filter: need both good AND bad examples for contrastive analysis
+    contrastive_topics = {
+        k: v for k, v in topic_groups.items()
+        if len(v["good"]) >= 1 and len(v["bad"]) >= 1
+    }
+
+    if not contrastive_topics:
+        log.info("  ⏭ Contrastive: no topics with both good and bad outcomes")
+        return stats
+
+    stats["contrastive_clusters"] = len(contrastive_topics)
+    log.info(f"  🔍 Contrastive: {len(contrastive_topics)} topics with mixed outcomes")
+
+    if dry_run:
+        for topic, groups in list(contrastive_topics.items())[:3]:
+            log.info(f"    • '{topic[:40]}': {len(groups['good'])} good, {len(groups['bad'])} bad")
+        return stats
+
+    # Init schema (reuse SHMR table)
+    conn = sqlite3.connect(str(DREAM_DB), timeout=30.0)
+    _init_schema(conn)
+
+    for topic, groups in contrastive_topics.items():
+        good_texts = "\n".join(
+            f"  - {m['text'][:200]}" for m in groups["good"][:5]
+        )
+        bad_texts = "\n".join(
+            f"  - {m['text'][:200]}" for m in groups["bad"][:5]
+        )
+
+        prompt = CONTRASTIVE_PROMPT.format(
+            good_memories=good_texts,
+            bad_memories=bad_texts,
+        )
+
+        try:
+            response = _call_infini(
+                prompt,
+                system="You are a contrastive analyst. Output only valid JSON.",
+                max_tokens=800,
+            )
+            if not response:
+                continue
+
+            # Parse JSON
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+
+            factors = json.loads(text)
+            if not isinstance(factors, list):
+                factors = [factors]
+
+            for f in factors[:3]:
+                if not isinstance(f, dict) or not f.get("factor"):
+                    continue
+
+                belief_id = str(uuid.uuid4())[:12]
+                confidence = max(0.0, min(1.0, float(f.get("confidence", 0.5))))
+                actionable = bool(f.get("actionable", False))
+
+                provenance_ids = (
+                    [m.get("id", "") for m in groups["good"][:5]] +
+                    [m.get("id", "") for m in groups["bad"][:5]]
+                )
+
+                conn.execute(
+                    """INSERT INTO harmonic_beliefs
+                    (belief_id, cluster_id, subject, predicate, confidence,
+                     provenance, action, rationale, dream_run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        belief_id,
+                        f"contrastive_{dream_run_id}",
+                        topic[:60],
+                        f["factor"],
+                        confidence,
+                        json.dumps(provenance_ids),
+                        "create",
+                        f"GOOD: {f.get('evidence_good', '')[:100]} | BAD: {f.get('evidence_bad', '')[:100]}",
+                        dream_run_id,
+                    ),
+                )
+
+                stats["factors_extracted"] += 1
+                if actionable:
+                    stats["actionable_rules"] += 1
+
+            log.info(
+                f"    ✅ '{topic[:30]}': {len(factors)} factors "
+                f"({sum(1 for f in factors if f.get('actionable'))} actionable)"
+            )
+
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            log.debug(f"    Contrastive parse failed for '{topic[:30]}': {e}")
+        except Exception as e:
+            log.debug(f"    Contrastive failed for '{topic[:30]}': {e}")
+
+    conn.commit()
+    conn.close()
+
+    log.info(
+        f"  📊 Contrastive 完成: {stats['contrastive_clusters']} topics → "
+        f"{stats['factors_extracted']} factors ({stats['actionable_rules']} actionable)"
     )
     return stats

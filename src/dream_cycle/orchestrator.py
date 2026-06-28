@@ -50,9 +50,11 @@ from dream_cycle.session import (
     mine_recent_sessions,
     scan_session_signals,
     generate_session_digest,
+    detect_feedback_signals,
 )
 from dream_cycle.vault import create_vault_stub
 from dream_cycle.llm import llm_verify_contradiction
+from dream_cycle.shmr import contrastive_beliefs
 
 # ── v6 "Safe Sleep" imports ──────────────────────────────────────────────────
 from dream_cycle.split import split_memories, get_val_memories, split_stats
@@ -289,11 +291,11 @@ def cmd_adopt(staging_dir: str = "") -> dict:
     return result
 
 
-def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
+def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict, dict] | None:
     """
     Phase 1: Fetch memories and session signals.
 
-    Returns ``(memories, sessions, signals)`` or *None* if nothing to process.
+    Returns ``(memories, sessions, signals, feedback)`` or *None* if nothing to process.
     """
     memories = get_incremental_memories(hours)
     log.info(f"📊 获取到 {len(memories)} 条新记忆 (最近 {hours} 小时, 增量)")
@@ -341,9 +343,7 @@ def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
                     {
                         "id": f"signal_{sig_type}_{sig['timestamp']:.0f}",
                         "text": f"[SESSION_{sig_type.upper()}] {sig['text']}",
-                        "created_at": datetime.fromtimestamp(
-                            sig["timestamp"], tz=timezone.utc
-                        ).isoformat(),
+                        "created_at": datetime.fromtimestamp(sig["timestamp"], tz=HKT).isoformat(),
                         "source": source,
                         "signal_type": sig_type,
                         "importance": importance,
@@ -353,7 +353,21 @@ def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
     else:
         log.info("📡 Session 信号: 0 条")
 
-    return memories, sessions, signals
+    # P1-1: Feedback signal detection (SkillOpt-inspired outcome classification)
+    feedback = detect_feedback_signals(hours)
+    if feedback["positive"] or feedback["negative"]:
+        log.info(
+            f"💬 Feedback: {len(feedback['positive'])} positive, "
+            f"{len(feedback['negative'])} negative, "
+            f"{len(feedback['session_outcomes'])} sessions classified"
+        )
+    # Tag memories with session outcome for contrastive reflection
+    for mem in memories:
+        sid = mem.get("session_id", "")
+        if sid in feedback.get("session_outcomes", {}):
+            mem["_outcome"] = feedback["session_outcomes"][sid]
+
+    return memories, sessions, signals, feedback
 
 
 def _execute_stages(
@@ -362,6 +376,7 @@ def _execute_stages(
     dry_run: bool,
     dream_run_id: int,
     use_staging: bool = True,
+    feedback: dict = None,
 ) -> tuple[dict, dict, dict, list[dict], dict]:
     """
     Phase 2: Run pipeline stages 1-3 + dream engine + Hebbian + slot conflicts.
@@ -494,6 +509,19 @@ def _execute_stages(
         shmr_stats = run_shmr(memories, dream_run_id, dry_run=dry_run)
         stats["shmr_beliefs"] = shmr_stats.get("beliefs_created", 0)
         stats["shmr_dampened"] = shmr_stats.get("contradictions_dampened", 0)
+
+        # P1-2: Contrastive Reflection (SkillOpt-inspired)
+        # Run after SHMR — uses session outcomes from feedback detection
+        if feedback and feedback.get("session_outcomes"):
+            contrastive_stats = contrastive_beliefs(
+                memories,
+                feedback["session_outcomes"],
+                dream_run_id,
+                dry_run=dry_run,
+            )
+            stats["contrastive_clusters"] = contrastive_stats.get("contrastive_clusters", 0)
+            stats["contrastive_factors"] = contrastive_stats.get("factors_extracted", 0)
+            stats["contrastive_actionable"] = contrastive_stats.get("actionable_rules", 0)
 
     # Three-tier degradation (from Mnemosyne BEAM)
     if "3" in stages and not dry_run:
@@ -704,7 +732,7 @@ def run_dream_cycle(
             _release_lock()
             return {"status": "skipped", "reason": "no_new_memories_incremental"}
 
-        memories, sessions, signals = prepared
+        memories, sessions, signals, feedback = prepared
         if not memories and not sessions:
             log.warning("⚠️ 没有新记忆或session, 跳过梦循环")
             _skip_run(dream_run_id, "no_memories")
@@ -718,6 +746,7 @@ def run_dream_cycle(
             dry_run,
             dream_run_id,
             use_staging=not dry_run,  # staging active unless dry-run
+            feedback=feedback,        # P1-1: feedback outcomes for contrastive reflection
         )
 
         # Phase 3: Finalize
