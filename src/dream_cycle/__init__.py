@@ -3,7 +3,7 @@ Dream Cycle — Modular Memory Consolidation Engine
 ===================================================
 Bio-inspired sleep cycle for AI agent memory.
 
-Architecture (v3.3, 2026-05-31):
+Architecture (v6.0 "Safe Sleep", 2026-06-28):
   config.py         — Constants & parameters
   db.py             — Database operations (PG/SQLite/Neo4j)
   similarity.py     — Similarity functions & vector ops
@@ -16,7 +16,12 @@ Architecture (v3.3, 2026-05-31):
   dream_engine.py   — REM walk v2 + SHY + threat simulation
   session.py        — Session mining & signal scanning
   health.py         — Dashboard & adaptive trigger
-  orchestrator.py   — Main pipeline, lock, report
+  shmr.py           — Self-Harmonizing Memory Reasoning
+  orchestrator.py   — Main pipeline, lock, report, staging interceptors
+  split.py          — Train/Val/Test split discipline (v6)
+  budget.py         — Edit budget / textual learning rate (v6)
+  validation.py     — Held-out replay validation (v6)
+  staging.py        — Staging + Adopt safety contract (v6)
 """
 
 from dream_cycle.config import (
@@ -31,7 +36,7 @@ from dream_cycle.config import (
     INFINI_MODEL,
     HKT,
 )
-from dream_cycle.orchestrator import run_dream_cycle
+from dream_cycle.orchestrator import run_dream_cycle, cmd_adopt
 
-__version__ = "3.3.0"
-__all__ = ["run_dream_cycle", "DREAM_DB", "__version__"]
+__version__ = "6.0.0"
+__all__ = ["run_dream_cycle", "cmd_adopt", "DREAM_DB", "__version__"]

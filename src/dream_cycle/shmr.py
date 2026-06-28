@@ -74,9 +74,9 @@ HARMONY_PROMPT = """You are a memory harmonizer. These memories belong to the sa
 4. **Output ONLY stable beliefs**: Return NEW or UPDATED facts with confidence scores. Don't regurgitate every input — synthesize.
 
 Output as JSON array of belief objects:
-[{"subject": "...", "predicate": "...", "confidence": 0.0-1.0,
+[{{"subject": "...", "predicate": "...", "confidence": 0.0-1.0,
   "action": "create"|"update"|"dampen", "target_belief_id": null|"existing_id",
-  "rationale": "one sentence explaining why"}]
+  "rationale": "one sentence explaining why"}}]
 
 RULES:
 - Confidence 0.9+ = highly corroborated (multiple sources agree)

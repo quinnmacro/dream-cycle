@@ -13,7 +13,9 @@ from dream_cycle.orchestrator import (
     run_dream_cycle, _cleanup_zombie_runs,
     resolve_slot_conflicts, format_report, send_telegram_report,
     review_vault_suggestions, batch_resolve_all_conflicts, batch_review_all_vault,
+    cmd_adopt,
 )
+from dream_cycle.staging import staging_status, latest_staging
 from dream_cycle.health import show_health_dashboard, check_dream_trigger, online_dedup_check
 from dream_cycle.session import mine_recent_sessions, generate_session_digest
 
@@ -34,7 +36,38 @@ def main():
     parser.add_argument("--vault-all", action="store_true", help="P10: 批量处理所有 pending vault 建议")
     parser.add_argument("--backlog", action="store_true", help="P10: 一次性清理所有积压(矛盾+vault)")
     parser.add_argument("--auto", action="store_true", help="自适应模式: 先检查触发条件，满足才执行")
+    # v6 Safe Sleep
+    parser.add_argument("--adopt", nargs="?", const="latest", default=None,
+                        help="采纳 staging 的修改 → 写入 PG (默认最新 staging, 可指定目录)")
+    parser.add_argument("--staging-status", action="store_true",
+                        help="查看 staging 目录状态 (pending/adopted)")
     args = parser.parse_args()
+
+    # v6: Adopt command
+    if args.adopt is not None:
+        staging_dir = args.adopt if args.adopt != "latest" else ""
+        result = cmd_adopt(staging_dir)
+        if "error" in result:
+            print(f"❌ Adopt failed: {result['error']}")
+        else:
+            print(f"✅ Adopt: {result.get('applied', 0)}/{result.get('total', 0)} proposals applied")
+            if result.get("errors"):
+                print(f"⚠️  {len(result['errors'])} errors:")
+                for e in result["errors"][:5]:
+                    print(f"   • {e['memory_id'][:8]}... {e['op']}: {e['error'][:80]}")
+        return result
+
+    # v6: Staging status
+    if args.staging_status:
+        status = staging_status()
+        print(f"📋 Staging 状态:")
+        print(f"  总计: {status['staging_dirs']} 个目录")
+        print(f"  待采纳: {status['pending']}")
+        print(f"  已采纳: {status['adopted']}")
+        if status.get("latest"):
+            lat = status["latest"]
+            print(f"  最新: {lat['dir']} ({lat['n_proposals']} proposals, adopted={lat['adopted']})")
+        return status
     
     if args.dedup_check:
         result = online_dedup_check(args.dedup_check)

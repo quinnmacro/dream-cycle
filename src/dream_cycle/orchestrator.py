@@ -9,6 +9,7 @@ __all__ = [
     "review_vault_suggestions",
     "batch_resolve_all_conflicts",
     "batch_review_all_vault",
+    "cmd_adopt",
 ]
 
 import os
@@ -52,6 +53,14 @@ from dream_cycle.session import (
 )
 from dream_cycle.vault import create_vault_stub
 from dream_cycle.llm import llm_verify_contradiction
+
+# ── v6 "Safe Sleep" imports ──────────────────────────────────────────────────
+from dream_cycle.split import split_memories, get_val_memories, split_stats
+from dream_cycle.budget import EditBudget, COSTLY_OPS
+from dream_cycle.staging import StagingBuffer, adopt_staging, latest_staging, staging_status
+from dream_cycle.validation import quick_validate
+
+import dream_cycle.db as _db_module  # for monkey-patching PG writes
 
 
 def _acquire_lock() -> bool:
@@ -105,6 +114,179 @@ def _cleanup_zombie_runs():
     conn.close()
     if cleaned > 0:
         log.info(f"🧹 清理了 {cleaned} 个僵尸 run")
+
+
+# ── v6 "Safe Sleep": Write Interceptor ───────────────────────────────────────
+# Monkey-patches db module functions to route PG writes into StagingBuffer
+# instead of executing them directly. Stage3 code is unchanged.
+
+_staging_active = False
+_staging_buffer: StagingBuffer | None = None
+_edit_budget: EditBudget | None = None
+_original_pg_query = None
+_original_update_memory_text = None
+_original_delete_memory = None
+
+
+def _install_staging_interceptors(buffer: StagingBuffer, budget: EditBudget):
+    """Install write interceptors that route PG writes to staging buffer."""
+    global _staging_active, _staging_buffer, _edit_budget
+    global _original_pg_query, _original_update_memory_text, _original_delete_memory
+
+    _staging_active = True
+    _staging_buffer = buffer
+    _edit_budget = budget
+
+    # Save originals
+    _original_pg_query = _db_module.pg_query
+    _original_update_memory_text = _db_module.update_memory_text
+    _original_delete_memory = _db_module.delete_memory
+
+    # Install interceptors
+    _db_module.pg_query = _intercepted_pg_query
+    _db_module.update_memory_text = _intercepted_update_memory_text
+    _db_module.delete_memory = _intercepted_delete_memory
+
+    log.info("🔒 Staging interceptors installed — PG writes redirected to buffer")
+
+
+def _remove_staging_interceptors():
+    """Restore original db functions."""
+    global _staging_active, _staging_buffer, _edit_budget
+    global _original_pg_query, _original_update_memory_text, _original_delete_memory
+
+    if _original_pg_query:
+        _db_module.pg_query = _original_pg_query
+    if _original_update_memory_text:
+        _db_module.update_memory_text = _original_update_memory_text
+    if _original_delete_memory:
+        _db_module.delete_memory = _original_delete_memory
+
+    _staging_active = False
+    _staging_buffer = None
+    _edit_budget = None
+    _original_pg_query = None
+    _original_update_memory_text = None
+    _original_delete_memory = None
+
+    log.info("🔓 Staging interceptors removed — PG writes restored to direct")
+
+
+def _intercepted_pg_query(sql: str) -> list:
+    """Intercept pg_query calls and route destructive writes to staging."""
+    sql_upper = sql.strip().upper()
+
+    # Non-destructive queries pass through
+    if sql_upper.startswith("SELECT"):
+        return _original_pg_query(sql)
+
+    # Destructive UPDATE on mem0 — intercept
+    if "UPDATE MEM0" in sql_upper:
+        # Parse memory_id from WHERE clause
+        import re
+        id_match = re.search(r"id::text\s*=\s*'([^']+)'", sql)
+        mem_id = id_match.group(1) if id_match else "unknown"
+
+        # Parse payload patch from SET clause
+        patch_match = re.search(r"payload\s*\|\|\s*'(\{[^}]+\})'", sql)
+        payload_patch = {}
+        if patch_match:
+            try:
+                payload_patch = json.loads(patch_match.group(1).replace("''", "'"))
+            except json.JSONDecodeError:
+                payload_patch = {"raw_sql_snippet": sql[:200]}
+
+        # Determine stage from payload content
+        stage = "unknown"
+        if "dream_boost" in sql:
+            stage = "boost"
+        elif "archived" in sql and "dedup" in sql:
+            stage = "dedup"
+        elif "archived" in sql and "decay" in sql:
+            stage = "decay"
+        elif "archived" in sql and "supersede" in sql:
+            stage = "supersede"
+        elif "archived" in sql and "slot" in sql:
+            stage = "supersede"
+        elif "extended" in sql:
+            stage = "extend"
+        elif "freshness" in sql:
+            stage = "boost"
+
+        # Budget check for costly ops
+        op_name = f"{stage}_archive" if "archived" in sql else stage
+        if _edit_budget and op_name in COSTLY_OPS:
+            if not _edit_budget.spend(op_name, detail=sql[:100], memory_id=mem_id):
+                log.info(f"  ⏸️ Budget skip: {op_name} on {mem_id[:8]}")
+                return []
+
+        # Route to staging buffer
+        if "archived" in sql:
+            _staging_buffer.add_archive(
+                mem_id, reason=sql[:150], stage=stage,
+                payload_patch=payload_patch,
+            )
+        else:
+            _staging_buffer.add_update_payload(
+                mem_id, payload_patch, reason=sql[:150], stage=stage,
+            )
+
+        log.info(f"  📝 Staged: UPDATE mem0 {stage} {mem_id[:8]}...")
+        return []
+
+    # DELETE — intercept
+    if sql_upper.startswith("DELETE"):
+        import re
+        id_match = re.search(r"id::text\s*=\s*'([^']+)'", sql)
+        mem_id = id_match.group(1) if id_match else "unknown"
+
+        if _edit_budget and not _edit_budget.spend("merge", detail=f"delete {mem_id[:8]}", memory_id=mem_id):
+            log.info(f"  ⏸️ Budget skip: delete {mem_id[:8]}")
+            return []
+
+        _staging_buffer.add_delete(mem_id, reason="merge secondary", stage="merge")
+        log.info(f"  📝 Staged: DELETE mem0 {mem_id[:8]}...")
+        return []
+
+    # Other writes (INSERT, CREATE TABLE, etc.) — pass through
+    return _original_pg_query(sql)
+
+
+def _intercepted_update_memory_text(memory_id: str, new_text: str) -> bool:
+    """Intercept update_memory_text and route to staging."""
+    if _edit_budget and not _edit_budget.spend("merge", detail=f"update text {memory_id[:8]}", memory_id=memory_id):
+        log.info(f"  ⏸️ Budget skip: update text {memory_id[:8]}")
+        return False
+
+    _staging_buffer.add_update_text(memory_id, new_text, reason="merge primary", stage="merge")
+    log.info(f"  📝 Staged: UPDATE TEXT {memory_id[:8]}...")
+    return True
+
+
+def _intercepted_delete_memory(memory_id: str) -> bool:
+    """Intercept delete_memory and route to staging."""
+    if _edit_budget and not _edit_budget.spend("merge", detail=f"delete {memory_id[:8]}", memory_id=memory_id):
+        log.info(f"  ⏸️ Budget skip: delete {memory_id[:8]}")
+        return False
+
+    _staging_buffer.add_delete(memory_id, reason="merge secondary", stage="merge")
+    log.info(f"  📝 Staged: DELETE {memory_id[:8]}...")
+    return True
+
+
+# ── v6: Adopt command ────────────────────────────────────────────────────────
+
+def cmd_adopt(staging_dir: str = "") -> dict:
+    """Apply staged proposals to live PG database."""
+    if not staging_dir:
+        staging_dir = latest_staging()
+        if not staging_dir:
+            return {"error": "no staging directory found"}
+
+    log.info(f"📋 Adopting from: {staging_dir}")
+    result = adopt_staging(staging_dir)
+    log.info(f"✅ Adopt complete: {result.get('applied', 0)}/{result.get('total', 0)} applied")
+    return result
 
 
 def _prepare_memories(hours: int) -> tuple[list[dict], list[dict], dict] | None:
@@ -179,12 +361,34 @@ def _execute_stages(
     stages: str,
     dry_run: bool,
     dream_run_id: int,
-) -> tuple[dict, dict, dict, list[dict]]:
+    use_staging: bool = True,
+) -> tuple[dict, dict, dict, list[dict], dict]:
     """
     Phase 2: Run pipeline stages 1-3 + dream engine + Hebbian + slot conflicts.
 
-    Returns ``(clusters, rem_results, stats, dream_walk_edges)``.
+    v6 "Safe Sleep": When use_staging=True, PG writes from stage3 are intercepted
+    and routed to a StagingBuffer. Held-out validation runs on val split before
+    staging files are written. Nothing touches live PG until adopt().
+
+    Returns ``(clusters, rem_results, stats, dream_walk_edges, staging_info)``.
     """
+    # ── v6: Initialize budget and split ──────────────────────────────────────
+    budget = EditBudget()
+    budget.start()
+    splits = split_memories(memories)
+    ss = split_stats(memories)
+    log.info(f"  📊 Split: train={ss['train']} val={ss['val']} test={ss['test']}")
+
+    # Stage 3 interceptors setup
+    staging_buffer = StagingBuffer() if use_staging else None
+    staging_info: dict = {
+        "use_staging": use_staging,
+        "split": ss,
+        "budget": {},
+        "validation": {},
+        "staging_dir": "",
+    }
+
     clusters: dict = {}
     if "1" in stages:
         clusters = stage1_shallow_sleep(memories)
@@ -195,13 +399,22 @@ def _execute_stages(
 
     stats: dict = {}
     if "3" in stages:
-        stats = stage3_deep_sleep(
-            rem_results,
-            dream_run_id,
-            dry_run,
-            total_memories=len(memories),
-            total_clusters=len(clusters),
-        )
+        # Install interceptors if staging is active
+        if use_staging and staging_buffer is not None:
+            _install_staging_interceptors(staging_buffer, budget)
+
+        try:
+            stats = stage3_deep_sleep(
+                rem_results,
+                dream_run_id,
+                dry_run,
+                total_memories=len(memories),
+                total_clusters=len(clusters),
+            )
+        finally:
+            # Always remove interceptors, even if stage3 fails
+            if use_staging:
+                _remove_staging_interceptors()
 
     # REM dream walk (Neo4j random walk v2)
     dream_walk_edges: list[dict] = []
@@ -289,7 +502,60 @@ def _execute_stages(
         stats["tier1_to_tier2"] = tier_stats.get("tier1_to_tier2", 0)
         stats["tier2_to_tier3"] = tier_stats.get("tier2_to_tier3", 0)
 
-    return clusters, rem_results, stats, dream_walk_edges
+    # ── v6: Validation + Staging ─────────────────────────────────────────────
+    if use_staging and staging_buffer is not None and not dry_run:
+        val_mems = splits.get("val", [])
+
+        # Held-out validation: check if proposed removals degrade val search quality
+        validation_result = None
+        if val_mems and staging_buffer.removed_ids:
+            validation_result = quick_validate(
+                val_mems,
+                staging_buffer.archived_ids,
+                staging_buffer.merged_ids,
+                memories,
+            )
+            staging_info["validation"] = {
+                "accepted": validation_result.accepted,
+                "hard_score": validation_result.hard_score,
+                "soft_score": validation_result.soft_score,
+                "n_val_queries": validation_result.n_val_queries,
+                "n_improved": validation_result.n_improved,
+                "n_same": validation_result.n_same,
+                "n_degraded": validation_result.n_degraded,
+                "reason": validation_result.reason,
+            }
+            gate_icon = "✅" if validation_result.accepted else "❌"
+            log.info(f"  {gate_icon} Validation: {validation_result.reason}")
+        else:
+            log.info("  ℹ️ Validation skipped (no val memories or no removals)")
+
+        # Write staging files (always, even if validation fails — for review)
+        staging_result = staging_buffer.write_staging(
+            dream_run_id,
+            validation_result=validation_result,
+            budget_summary=budget.summary(),
+            split_stats=ss,
+        )
+        staging_info["staging_dir"] = staging_result.staging_dir
+        staging_info["n_proposals"] = staging_result.n_proposals
+
+        gate_icon = "✅" if staging_result.validation_accepted else "❌"
+        log.info(f"  📋 Staged {staging_result.n_proposals} proposals → {staging_result.staging_dir}")
+        log.info(f"  {gate_icon} Gate: {staging_result.validation_reason}")
+        log.info(f"  💰 Budget: {budget.summary()}")
+        if budget.skipped:
+            log.info(f"  {budget.skipped_summary()}")
+
+    elif use_staging and staging_buffer is not None and dry_run:
+        # Dry-run: just log what would be staged
+        s = staging_buffer.stats()
+        staging_info["dry_run_proposals"] = s
+        log.info(f"  📋 Dry-run: {s['total_proposals']} proposals would be staged")
+
+    staging_info["budget"] = budget.summary()
+
+    return clusters, rem_results, stats, dream_walk_edges, staging_info
 
 
 def _finalize_run(
@@ -300,6 +566,7 @@ def _finalize_run(
     stats: dict,
     dry_run: bool,
     start_time: datetime,
+    staging_info: dict = None,
 ) -> dict:
     """
     Phase 3: Update manifest, record results, return summary.
@@ -376,7 +643,24 @@ def _finalize_run(
         "stats": stats,
     }
 
-    log.info(f"🌅 梦循环完成 — {result['duration_seconds']:.1f}s")
+    # v6: Add staging info to result
+    if staging_info:
+        result["staging"] = staging_info
+        si = staging_info
+        if si.get("staging_dir"):
+            val = si.get("validation", {})
+            gate_icon = "✅" if val.get("accepted", True) else "❌"
+            result["status"] = "staged"
+            log.info(
+                f"🌅 梦循环完成 (v6 Safe Sleep) — {result['duration_seconds']:.1f}s | "
+                f"📋 {si.get('n_proposals', 0)} proposals staged → {si['staging_dir']} | "
+                f"{gate_icon} Gate: {val.get('reason', 'n/a')}"
+            )
+        else:
+            log.info(f"🌅 梦循环完成 — {result['duration_seconds']:.1f}s")
+    else:
+        log.info(f"🌅 梦循环完成 — {result['duration_seconds']:.1f}s")
+
     return result
 
 
@@ -427,12 +711,13 @@ def run_dream_cycle(
             _release_lock()
             return {"status": "skipped", "reason": "no_memories"}
 
-        # Phase 2: Execute stages
-        clusters, rem_results, stats, dream_walk_edges = _execute_stages(
+        # Phase 2: Execute stages (with staging interceptors)
+        clusters, rem_results, stats, dream_walk_edges, staging_info = _execute_stages(
             memories,
             stages,
             dry_run,
             dream_run_id,
+            use_staging=not dry_run,  # staging active unless dry-run
         )
 
         # Phase 3: Finalize
@@ -444,6 +729,7 @@ def run_dream_cycle(
             stats,
             dry_run,
             start_time,
+            staging_info=staging_info,
         )
         _release_lock()
         return result

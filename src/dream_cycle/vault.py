@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dream_cycle.config import HKT, VAULT_DIR, log
+from dream_cycle.llm import _call_infini
 
 def _compute_memory_age_days(created_at: str | None) -> float | None:
     """计算记忆的天数年龄"""
