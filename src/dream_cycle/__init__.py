@@ -38,5 +38,5 @@ from dream_cycle.config import (
 )
 from dream_cycle.orchestrator import run_dream_cycle, cmd_adopt
 
-__version__ = "6.0.0"
+__version__ = "6.2.0"
 __all__ = ["run_dream_cycle", "cmd_adopt", "DREAM_DB", "__version__"]

@@ -113,39 +113,57 @@ def stage3_deep_sleep(
             stats["deduped"] += 1
 
     # 2. 合并 (用 LLM 生成摘要, 删除被合并的)
+    # P2-3: Parallel merge — LLM calls are I/O-bound, parallelize with ThreadPool
     merged_texts_log = []
-    for item in rem_results.get("merge_candidates", []):
+    merge_candidates = rem_results.get("merge_candidates", [])
+
+    def _process_merge(item: dict) -> tuple:
+        """Process one merge candidate. Returns (success, primary_id, secondary_id, merged_text)."""
         primary = item["primary"]
         secondary = item["secondary"]
-
         log.info(
             f"  🔄 合并候选: {primary['id'][:8]} ← {secondary['id'][:8]} "
             f"(dist={item.get('distance', 'N/A')}, method={item.get('method', 'N/A')})"
         )
+        if dry_run:
+            return (True, primary["id"], secondary["id"], "(dry-run)")
 
-        if not dry_run:
-            merged_text = llm_merge_memories([primary["text"], secondary["text"]])
-            if merged_text:
-                # 更新 primary 的文本
-                if update_memory_text(primary["id"], merged_text):
-                    # 删除 secondary
-                    if delete_memory(secondary["id"]):
+        merged_text = llm_merge_memories([primary["text"], secondary["text"]])
+        if not merged_text:
+            return (False, primary["id"], secondary["id"], "")
+
+        if update_memory_text(primary["id"], merged_text):
+            if delete_memory(secondary["id"]):
+                return (True, primary["id"], secondary["id"], merged_text)
+        return (False, primary["id"], secondary["id"], "")
+
+    if merge_candidates:
+        # P2-3: Parallel merge (max 3 workers to avoid LLM rate limits)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        max_workers = min(3, len(merge_candidates))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_process_merge, item): item for item in merge_candidates}
+            for future in as_completed(futures):
+                try:
+                    success, pid, sid, merged_text = future.result()
+                    if success and not dry_run and merged_text:
                         stats["merged"] += 1
+                        item = futures[future]
                         conn.execute(
                             "INSERT INTO dedup_log (dream_run_id, kept_id, removed_id, similarity, merged_text) VALUES (?, ?, ?, ?, ?)",
                             (
-                                dream_run_id,
-                                primary["id"],
-                                secondary["id"],
+                                dream_run_id, pid, sid,
                                 item.get("similarity", 0),
                                 merged_text[:500],
                             ),
                         )
                         merged_texts_log.append(
-                            f"{primary['id'][:8]}←{secondary['id'][:8]}: {merged_text[:80]}"
+                            f"{pid[:8]}←{sid[:8]}: {merged_text[:80]}"
                         )
-            else:
-                log.info("    ⏭️ LLM 合并失败, 保留两条")
+                    elif success and dry_run:
+                        stats["merged"] += 1
+                except Exception as e:
+                    log.warning(f"  ⚠️ Merge failed: {e}")
 
     # 3. 关系推断 + Neo4j 回写
     neo4j_relations = []

@@ -10,6 +10,7 @@ __all__ = [
     "call_llm",
     "call_quick",
     "call_deep",
+    "call_json",
     "llm_merge_memories",
     "llm_verify_contradiction",
     "llm_extract_entities",
@@ -226,6 +227,86 @@ def call_deep(prompt: str, max_tokens: int = 1024, temperature: float = 0.3, sys
     Use for: SHMR harmonization, contrastive reflection, merge, contradiction verification.
     """
     return _call_infini(prompt, model=INFINI_MODEL, max_tokens=max_tokens, temperature=temperature, system=system)
+
+
+# ─── P2-4: JSON Retry Escalation (SkillOpt-inspired) ─────────────────
+
+_JSON_RETRY_SUFFIX = "\n\nIMPORTANT: Your previous reply was not valid JSON. Output ONLY a valid JSON object/array, no markdown, no explanation."
+
+
+def call_json(prompt: str, max_tokens: int = 512, temperature: float = 0.1,
+              system: str = "", model: str = "") -> dict | list | None:
+    """P2-4: LLM call with JSON retry escalation.
+
+    First attempt: normal call.
+    If JSON parse fails: retry with escalation suffix appended to prompt.
+    Returns parsed JSON (dict or list) or None.
+    """
+    import re
+
+    if not model:
+        model = INFINI_MODEL
+
+    # First attempt
+    response = _call_infini(prompt, model=model, max_tokens=max_tokens,
+                            temperature=temperature, system=system)
+    if not response:
+        return None
+
+    parsed = _try_parse_json(response)
+    if parsed is not None:
+        return parsed
+
+    # Retry with escalation
+    log.debug(f"  🔄 JSON retry: first attempt not valid JSON, escalating")
+    escalated = prompt + _JSON_RETRY_SUFFIX
+    response2 = _call_infini(escalated, model=model, max_tokens=max_tokens,
+                             temperature=temperature, system=system)
+    if not response2:
+        return None
+
+    parsed2 = _try_parse_json(response2)
+    if parsed2 is not None:
+        return parsed2
+
+    log.debug(f"  ⚠️ JSON retry failed after escalation")
+    return None
+
+
+def _try_parse_json(text: str) -> dict | list | None:
+    """Try to parse JSON from LLM response, handling markdown code blocks."""
+    import re
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+    # Try direct parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, (dict, list)):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find JSON in the response
+    match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r"\[[^\]]*\]", text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    return None
 
 
 def llm_merge_memories(texts: list[str]) -> str | None:

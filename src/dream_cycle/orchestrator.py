@@ -504,7 +504,8 @@ def _execute_stages(
             rem_results["slot_conflicts_list"] = slot_conflicts
 
     # SHMR: Self-Harmonizing Memory Reasoning (from Mnemosyne)
-    if "3" in stages:
+    # P2-2: Depth planning — skip if budget < 20% remaining
+    if "3" in stages and budget.fraction_remaining >= 0.20:
         from dream_cycle.shmr import run_shmr
         shmr_stats = run_shmr(memories, dream_run_id, dry_run=dry_run)
         stats["shmr_beliefs"] = shmr_stats.get("beliefs_created", 0)
@@ -512,7 +513,7 @@ def _execute_stages(
 
         # P1-2: Contrastive Reflection (SkillOpt-inspired)
         # Run after SHMR — uses session outcomes from feedback detection
-        if feedback and feedback.get("session_outcomes"):
+        if feedback and feedback.get("session_outcomes") and budget.fraction_remaining >= 0.15:
             contrastive_stats = contrastive_beliefs(
                 memories,
                 feedback["session_outcomes"],
@@ -522,8 +523,11 @@ def _execute_stages(
             stats["contrastive_clusters"] = contrastive_stats.get("contrastive_clusters", 0)
             stats["contrastive_factors"] = contrastive_stats.get("factors_extracted", 0)
             stats["contrastive_actionable"] = contrastive_stats.get("actionable_rules", 0)
+    elif "3" in stages:
+        log.info(f"  ⏸ Skipping SHMR/Contrastive (budget {budget.fraction_remaining:.0%} < 20%)")
+        stats["shmr_skipped"] = "budget_low"
 
-    # Three-tier degradation (from Mnemosyne BEAM)
+    # Three-tier degradation (from Mnemosyne BEAM) — always runs, it's cheap
     if "3" in stages and not dry_run:
         from dream_cycle.stage3 import degrade_tiers
         tier_stats = degrade_tiers(dry_run=dry_run)
