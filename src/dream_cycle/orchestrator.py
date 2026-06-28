@@ -62,7 +62,9 @@ from dream_cycle.budget import EditBudget, COSTLY_OPS
 from dream_cycle.staging import StagingBuffer, adopt_staging, latest_staging, staging_status
 from dream_cycle.validation import quick_validate, safety_probe
 
-import dream_cycle.db as _db_module  # for monkey-patching PG writes
+from dream_cycle.ops import create_backend, StagingBackend, DirectBackend
+
+import dream_cycle.db as _db_module  # kept for pg_query in _prepare_memories
 
 
 def _acquire_lock() -> bool:
@@ -116,164 +118,6 @@ def _cleanup_zombie_runs():
     conn.close()
     if cleaned > 0:
         log.info(f"🧹 清理了 {cleaned} 个僵尸 run")
-
-
-# ── v6 "Safe Sleep": Write Interceptor ───────────────────────────────────────
-# Monkey-patches db module functions to route PG writes into StagingBuffer
-# instead of executing them directly. Stage3 code is unchanged.
-
-_staging_active = False
-_staging_buffer: StagingBuffer | None = None
-_edit_budget: EditBudget | None = None
-_original_pg_query = None
-_original_update_memory_text = None
-_original_delete_memory = None
-
-
-def _install_staging_interceptors(buffer: StagingBuffer, budget: EditBudget):
-    """Install write interceptors that route PG writes to staging buffer."""
-    global _staging_active, _staging_buffer, _edit_budget
-    global _original_pg_query, _original_update_memory_text, _original_delete_memory
-
-    _staging_active = True
-    _staging_buffer = buffer
-    _edit_budget = budget
-
-    # Save originals
-    _original_pg_query = _db_module.pg_query
-    _original_update_memory_text = _db_module.update_memory_text
-    _original_delete_memory = _db_module.delete_memory
-
-    # Install interceptors
-    _db_module.pg_query = _intercepted_pg_query
-    _db_module.update_memory_text = _intercepted_update_memory_text
-    _db_module.delete_memory = _intercepted_delete_memory
-
-    log.info("🔒 Staging interceptors installed — PG writes redirected to buffer")
-
-
-def _remove_staging_interceptors():
-    """Restore original db functions."""
-    global _staging_active, _staging_buffer, _edit_budget
-    global _original_pg_query, _original_update_memory_text, _original_delete_memory
-
-    if _original_pg_query:
-        _db_module.pg_query = _original_pg_query
-    if _original_update_memory_text:
-        _db_module.update_memory_text = _original_update_memory_text
-    if _original_delete_memory:
-        _db_module.delete_memory = _original_delete_memory
-
-    _staging_active = False
-    _staging_buffer = None
-    _edit_budget = None
-    _original_pg_query = None
-    _original_update_memory_text = None
-    _original_delete_memory = None
-
-    log.info("🔓 Staging interceptors removed — PG writes restored to direct")
-
-
-def _intercepted_pg_query(sql: str) -> list:
-    """Intercept pg_query calls and route destructive writes to staging."""
-    sql_upper = sql.strip().upper()
-
-    # Non-destructive queries pass through
-    if sql_upper.startswith("SELECT"):
-        return _original_pg_query(sql)
-
-    # Destructive UPDATE on mem0 — intercept
-    if "UPDATE MEM0" in sql_upper:
-        # Parse memory_id from WHERE clause
-        import re
-        id_match = re.search(r"id::text\s*=\s*'([^']+)'", sql)
-        mem_id = id_match.group(1) if id_match else "unknown"
-
-        # Parse payload patch from SET clause
-        patch_match = re.search(r"payload\s*\|\|\s*'(\{[^}]+\})'", sql)
-        payload_patch = {}
-        if patch_match:
-            try:
-                payload_patch = json.loads(patch_match.group(1).replace("''", "'"))
-            except json.JSONDecodeError:
-                payload_patch = {"raw_sql_snippet": sql[:200]}
-
-        # Determine stage from payload content
-        stage = "unknown"
-        if "dream_boost" in sql:
-            stage = "boost"
-        elif "archived" in sql and "dedup" in sql:
-            stage = "dedup"
-        elif "archived" in sql and "decay" in sql:
-            stage = "decay"
-        elif "archived" in sql and "supersede" in sql:
-            stage = "supersede"
-        elif "archived" in sql and "slot" in sql:
-            stage = "supersede"
-        elif "extended" in sql:
-            stage = "extend"
-        elif "freshness" in sql:
-            stage = "boost"
-
-        # Budget check for costly ops
-        op_name = f"{stage}_archive" if "archived" in sql else stage
-        if _edit_budget and op_name in COSTLY_OPS:
-            if not _edit_budget.spend(op_name, detail=sql[:100], memory_id=mem_id):
-                log.info(f"  ⏸️ Budget skip: {op_name} on {mem_id[:8]}")
-                return []
-
-        # Route to staging buffer
-        if "archived" in sql:
-            _staging_buffer.add_archive(
-                mem_id, reason=sql[:150], stage=stage,
-                payload_patch=payload_patch,
-            )
-        else:
-            _staging_buffer.add_update_payload(
-                mem_id, payload_patch, reason=sql[:150], stage=stage,
-            )
-
-        log.info(f"  📝 Staged: UPDATE mem0 {stage} {mem_id[:8]}...")
-        return []
-
-    # DELETE — intercept
-    if sql_upper.startswith("DELETE"):
-        import re
-        id_match = re.search(r"id::text\s*=\s*'([^']+)'", sql)
-        mem_id = id_match.group(1) if id_match else "unknown"
-
-        if _edit_budget and not _edit_budget.spend("merge", detail=f"delete {mem_id[:8]}", memory_id=mem_id):
-            log.info(f"  ⏸️ Budget skip: delete {mem_id[:8]}")
-            return []
-
-        _staging_buffer.add_delete(mem_id, reason="merge secondary", stage="merge")
-        log.info(f"  📝 Staged: DELETE mem0 {mem_id[:8]}...")
-        return []
-
-    # Other writes (INSERT, CREATE TABLE, etc.) — pass through
-    return _original_pg_query(sql)
-
-
-def _intercepted_update_memory_text(memory_id: str, new_text: str) -> bool:
-    """Intercept update_memory_text and route to staging."""
-    if _edit_budget and not _edit_budget.spend("merge", detail=f"update text {memory_id[:8]}", memory_id=memory_id):
-        log.info(f"  ⏸️ Budget skip: update text {memory_id[:8]}")
-        return False
-
-    _staging_buffer.add_update_text(memory_id, new_text, reason="merge primary", stage="merge")
-    log.info(f"  📝 Staged: UPDATE TEXT {memory_id[:8]}...")
-    return True
-
-
-def _intercepted_delete_memory(memory_id: str) -> bool:
-    """Intercept delete_memory and route to staging."""
-    if _edit_budget and not _edit_budget.spend("merge", detail=f"delete {memory_id[:8]}", memory_id=memory_id):
-        log.info(f"  ⏸️ Budget skip: delete {memory_id[:8]}")
-        return False
-
-    _staging_buffer.add_delete(memory_id, reason="merge secondary", stage="merge")
-    log.info(f"  📝 Staged: DELETE {memory_id[:8]}...")
-    return True
 
 
 # ── v6: Adopt command ────────────────────────────────────────────────────────
@@ -394,8 +238,9 @@ def _execute_stages(
     ss = split_stats(memories)
     log.info(f"  📊 Split: train={ss['train']} val={ss['val']} test={ss['test']}")
 
-    # Stage 3 interceptors setup
-    staging_buffer = StagingBuffer() if use_staging else None
+    # Stage 3: Create backend (staging or direct)
+    backend = create_backend(use_staging=use_staging, budget=budget)
+    staging_buffer = backend.buffer if isinstance(backend, StagingBackend) else None
     staging_info: dict = {
         "use_staging": use_staging,
         "split": ss,
@@ -414,22 +259,14 @@ def _execute_stages(
 
     stats: dict = {}
     if "3" in stages:
-        # Install interceptors if staging is active
-        if use_staging and staging_buffer is not None:
-            _install_staging_interceptors(staging_buffer, budget)
-
-        try:
-            stats = stage3_deep_sleep(
-                rem_results,
-                dream_run_id,
-                dry_run,
-                total_memories=len(memories),
-                total_clusters=len(clusters),
-            )
-        finally:
-            # Always remove interceptors, even if stage3 fails
-            if use_staging:
-                _remove_staging_interceptors()
+        stats = stage3_deep_sleep(
+            rem_results,
+            dream_run_id,
+            backend=backend,
+            dry_run=dry_run,
+            total_memories=len(memories),
+            total_clusters=len(clusters),
+        )
 
     # REM dream walk (Neo4j random walk v2)
     dream_walk_edges: list[dict] = []

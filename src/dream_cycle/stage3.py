@@ -26,11 +26,11 @@ from dream_cycle.config import (
 from dream_cycle.db import (
     pg_query,
     mark_manifest_archived,
-    delete_memory,
-    update_memory_text,
     dedup_neo4j_relations,
     write_relations_to_neo4j,
 )
+from dream_cycle.types import MemoryOp
+from dream_cycle.ops import MemoryBackend, DirectBackend
 from dream_cycle.similarity import combined_similarity
 from dream_cycle.dream_engine import rem_shy_downscale, rem_threat_simulation
 from dream_cycle.llm import llm_merge_memories, llm_verify_contradiction
@@ -41,6 +41,7 @@ from dream_cycle.vault import create_vault_stub
 def stage3_deep_sleep(
     rem_results: dict,
     dream_run_id: int,
+    backend: MemoryBackend | None = None,
     dry_run: bool = False,
     total_memories: int = 0,
     total_clusters: int = 0,
@@ -53,8 +54,19 @@ def stage3_deep_sleep(
     3. 关系推断: 识别实体间新关系 → 写入 Neo4j
     4. 衰减清理: 标记低价值记忆
     5. Vault 建议: 生成沉淀建议
+
+    Args:
+        rem_results: Stage 2 output dict with boosted/dedup/merge/decay candidates
+        dream_run_id: Current dream run ID
+        backend: MemoryBackend for PG writes (None = DirectBackend)
+        dry_run: If True, skip all writes
+        total_memories: Total memory count (for health score)
+        total_clusters: Total cluster count (for health score)
     """
-    log.info(f"🌊 Stage 3: Deep Sleep — 执行整合{' (dry-run)' if dry_run else ''}")
+    if backend is None:
+        backend = DirectBackend()
+
+    log.info(f"🌊 Stage 3: Deep Sleep — 执行整合{' (dry-run)' if dry_run else ''} [backend={type(backend).__name__}]")
 
     stats = {
         "deduped": 0,
@@ -72,11 +84,21 @@ def stage3_deep_sleep(
         m = item["memory"]
         score = item["score"]
         if not dry_run:
-            # 写入 PG payload: dream_boost + freshness=fresh (P5 联动)
             reason = item.get("reason", "").replace('"', "").replace("'", "")
-            pg_query(
-                f"""UPDATE mem0 SET payload = payload || '{{"dream_boost": true, "boost_score": {score:.3f}, "boost_reason": "{reason}", "boosted_at": "{datetime.now(HKT).isoformat()}", "freshness": "fresh", "freshness_source": "dream_cycle_boost"}}' WHERE id::text = '{m["id"]}'"""
-            )
+            backend.execute(MemoryOp(
+                op="boost",
+                memory_id=m["id"],
+                stage="boost",
+                payload_patch={
+                    "dream_boost": True,
+                    "boost_score": round(score, 3),
+                    "boost_reason": reason,
+                    "boosted_at": datetime.now(HKT).isoformat(),
+                    "freshness": "fresh",
+                    "freshness_source": "dream_cycle_boost",
+                },
+                reason=f"importance={score:.3f}",
+            ))
         log.info(
             f"  🔥 Boost: {m['id'][:8]} score={score:.3f} ({item.get('reason', '')})"
         )
@@ -100,10 +122,16 @@ def stage3_deep_sleep(
         )
 
         if not dry_run:
-            # 归档而非删除: 写入归档标记到 payload
-            pg_query(
-                f"""UPDATE mem0 SET payload = payload || '{{\"archived\": true, \"archived_reason\": \"dedup\", \"archived_at\": \"{datetime.now(HKT).isoformat()}\", \"superseded_by\": \"{keep_id}\"}}' WHERE id::text = '{remove_id}'"""
-            )
+            backend.execute(MemoryOp(
+                op="archive",
+                memory_id=remove_id,
+                stage="dedup",
+                payload_patch={
+                    "archived_at": datetime.now(HKT).isoformat(),
+                },
+                superseded_by=keep_id,
+                reason=f"dedup sim={sim:.3f}",
+            ))
             stats["deduped"] += 1
             conn.execute(
                 "INSERT INTO dedup_log (dream_run_id, kept_id, removed_id, similarity) VALUES (?, ?, ?, ?)",
@@ -132,8 +160,14 @@ def stage3_deep_sleep(
         if not merged_text:
             return (False, primary["id"], secondary["id"], "")
 
-        if update_memory_text(primary["id"], merged_text):
-            if delete_memory(secondary["id"]):
+        if backend.execute(MemoryOp(
+            op="update_text", memory_id=primary["id"], stage="merge",
+            new_text=merged_text, reason=f"merge from {secondary['id'][:8]}",
+        )):
+            if backend.execute(MemoryOp(
+                op="delete", memory_id=secondary["id"], stage="merge",
+                reason=f"merged into {primary['id'][:8]}",
+            )):
                 return (True, primary["id"], secondary["id"], merged_text)
         return (False, primary["id"], secondary["id"], "")
 
@@ -266,10 +300,18 @@ def stage3_deep_sleep(
             f"  📉 衰减→归档候选: {m['id'][:8]} (score={score:.3f}, freshness={freshness})"
         )
         if not dry_run:
-            # 归档: 写入归档标记到 payload + P5 freshness 联动
-            pg_query(
-                f"""UPDATE mem0 SET payload = payload || '{{"archived": true, "archived_reason": "decay", "archived_at": "{datetime.now(HKT).isoformat()}", "decay_score": {score:.3f}, "freshness": "{freshness}", "freshness_source": "dream_cycle_decay"}}' WHERE id::text = '{m["id"]}'"""
-            )
+            backend.execute(MemoryOp(
+                op="archive",
+                memory_id=m["id"],
+                stage="decay",
+                payload_patch={
+                    "archived_at": datetime.now(HKT).isoformat(),
+                    "decay_score": round(score, 3),
+                    "freshness": freshness,
+                    "freshness_source": "dream_cycle_decay",
+                },
+                reason=f"decay score={score:.3f}",
+            ))
             mark_manifest_archived([m["id"]], conn=conn)
         stats["decayed"] += 1
 
