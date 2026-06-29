@@ -23,42 +23,56 @@
 
 Quinn（我们共同的用户）让你做 audit，让我做日常维护。我们之间没有直接通信通道，靠 Quinn 中转和文件系统。
 
-## 当前状态（2026-05-31 v3.3.0）
+## 当前状态（2026-06-29 v7.1.0）
 
-### v3.3.0 变更（Claude Code 审计后修复）
-**commit**: 96aa294 (foxcc/feat: v3.3.0)
+### v7.1.0 变更（Backend 抽象层完成）
+**commit**: 5985fba (test: 45→150 tests covering v7 modules)
 
-#### 10 个关键 Bug 修复
-**Tier 1 — NameError 崩溃（3个）**
-- `__main__.py`: 缺失 `json`, `sqlite3`, `online_dedup_check` 导入 → 3 个 CLI 命令崩溃
-- `db.py:236`: 缺失 `text_hash` 导入 → `update_manifest()` 每次必崩
-- `stage3.py:262`: 缺失 `_KEYWORD_DOMAIN_BOOST` 导入 → vault 建议处理崩溃
+#### 架构重构：MemoryBackend 替代 monkey-patching
+**之前 (v6)**：staging 通过全局 monkey-patch 拦截 PG 写入
+```python
+# orchestrator.py — 旧方式（已删除 158 行）
+_db_module.pg_query = _intercepted_pg_query  # 全局替换
+```
+问题：SQL 正则解析提取意图、crash 时 interceptor 泄漏、`from db import pg_query` 绕过拦截、不可测试。
 
-**Tier 2 — 安全漏洞（2个）**
-- `db.py update_memory_text()`: `shell=True` + 手工转义 → shell 注入。已改用 stdin pipe + `to_jsonb()`
-- `stage3.py resolve_slot_conflicts()`: LLM explanation 单引号截断 SQL → SUPERSEDE 归档静默失败
+**之后 (v7)**：Backend 接口 + 结构化操作
+```python
+# ops.py — 新方式
+backend = create_backend(use_staging=True, budget=budget)
+backend.execute(MemoryOp(op="archive", memory_id="...", stage="dedup", reason="..."))
+```
 
-**Tier 3 — 逻辑错误（3个）**
-- `stage2.py:224`: recall_count 回退值用 `len(group)` → 大 cluster 评分虚高。已改为 0
-- `stage2.py:384`: vault 门控 `passes_any` 恒真 → 三重门限形同虚设。已删除
-- `orchestrator.py:353`: no_memories 跳过路径缺 `_skip_run()` → dream_runs 孤儿记录
+#### 6 种 MemoryOp 类型
+`archive` | `update_text` | `delete` | `boost` | `extend` | `degrade`
 
-**Tier 4 — 一致性（2个）**
-- `orchestrator.py` slug 生成缺 `|` 替换 → 与 vault.py 不一致
-- `db.py pg_query` 签名撒谎（params 参数是空壳，返回类型标注错误）
+- stage3.py: 0 处直连 SQL mutation（6 处 SELECT 读保留）
+- resolve_slot_conflicts: 3 处 SQL → MemoryOp (archive + 2× extend)
+- degrade_tiers: 2 处 SQL → 2× MemoryOp (degrade)
 
-#### 性能优化（100-150x 提升）
-- `detect_slot_conflicts`: 批量查询 IDs+文本+向量邻居（2次 docker exec vs ~200次）
-- `batch_resolve_all_conflicts`: 预取所有文本+时间戳（1次 docker exec vs ~150次）
-- `stage2→orchestrator`: 缓存 `cluster_entities` 到 `rem_results`，避免重复 LLM 提取
-- `llm.py`: API key 模块级缓存，避免每次调用读 config.yaml
+#### 150 个测试（原 45 → 150）
+新增 5 个测试文件覆盖 v7 模块：
+- test_types.py: MemoryOp, DreamMemory, BudgetSummary (20 tests)
+- test_ops.py: DirectBackend routing, StagingBackend gating (18 tests)
+- test_budget.py: EditBudget spend/fraction/token (28 tests)
+- test_split.py: deterministic hash split (19 tests)
+- test_staging.py: StagingBuffer ops/stats (20 tests)
 
-#### 代码质量改进
-- `text_hash` 从 `config.py` 移到 `similarity.py`（消除循环依赖）
-- 所有导入路径已同步更新（db.py, health.py, stage1.py, tests）
+#### v6.0-v6.3 SkillOpt-Sleep 机制移植
+- v6.0 "Safe Sleep": Staging + Split + Validation + Edit Budget (+1,279 lines)
+- v6.1 "Smart Sleep": Feedback Signals + Contrastive + Cache + Dual-backend (+542 lines)
+- v6.2 "Efficient Sleep": Depth Planning + Parallel Merge + JSON Retry (+123 lines)
+- v6.3 "Full Sleep": Associative Recall + Gate Safety Probe (+162 lines)
 
-#### 验证状态
-- ✅ 45 个单元测试全通过
+#### v7.0 "Clean Sleep" — 文件位置整理 + monkey-patch 删除
+- 删除 4 份代码副本（hermes-config/scripts/skills/ 中的残留）
+- 删除 158L interceptor 代码
+- 唯一来源: `/root/repos/dream-cycle/src/dream_cycle/`
+- v7.1: 剩余 SQL mutation 全部迁移到 backend
+
+#### 20 个模块（8,427 行）
+orchestrator(1128) → stage3(899) → stage2(739) → shmr(604) → dream_engine(576) → db(526) → staging(416) → health(399) → llm(383) → validation(360) → entities(339) → config(339) → session(338) → ops(219) → vault(191) → __main__(184) → similarity(174) → budget(163) → stage1(158) → types(152)
+- ✅ 150 个单元测试全通过
 - ✅ 所有 CLI 命令正常（--manifest-stats, --history, --dedup-check, --dry-run）
 - ✅ 所有模块导入检查通过
 
