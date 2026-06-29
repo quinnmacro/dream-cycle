@@ -94,6 +94,19 @@ class DirectBackend:
                 )
                 return True
 
+            elif op.op == "degrade":
+                # Tier degradation: update both text (data field) and metadata
+                patch = dict(op.payload_patch)
+                patch_json = json.dumps(patch, ensure_ascii=False)
+                new_data = json.dumps(op.new_text, ensure_ascii=False)
+                _pg_query(
+                    f"UPDATE mem0 SET payload = payload || '{patch_json}' "
+                    f"|| jsonb_set(payload, '{{data}}', '{new_data}') "
+                    f"WHERE id::text = '{op.memory_id}'"
+                )
+                log.debug(f"  ✓ Degraded {op.memory_id[:8]} ({op.stage})")
+                return True
+
             else:
                 log.warning(f"  ⚠️ Unknown op type: {op.op}")
                 return False
@@ -156,6 +169,13 @@ class StagingBackend:
             self._buffer.add_update_payload(
                 op.memory_id, op.payload_patch,
                 reason=op.reason, stage=op.stage,
+            )
+        elif op.op == "degrade":
+            # Degrade = update_text + metadata patch
+            self._buffer.add_update_text(
+                op.memory_id, op.new_text,
+                reason=op.reason, stage=op.stage,
+                payload_patch=op.payload_patch,
             )
 
         self._executed.append(op)

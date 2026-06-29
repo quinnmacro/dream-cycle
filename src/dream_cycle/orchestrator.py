@@ -367,7 +367,7 @@ def _execute_stages(
     # Three-tier degradation (from Mnemosyne BEAM) — always runs, it's cheap
     if "3" in stages and not dry_run:
         from dream_cycle.stage3 import degrade_tiers
-        tier_stats = degrade_tiers(dry_run=dry_run)
+        tier_stats = degrade_tiers(dry_run=dry_run, backend=backend)
         stats["tier1_to_tier2"] = tier_stats.get("tier1_to_tier2", 0)
         stats["tier2_to_tier3"] = tier_stats.get("tier2_to_tier3", 0)
 

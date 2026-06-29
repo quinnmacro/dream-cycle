@@ -327,7 +327,7 @@ def stage3_deep_sleep(
         # P7: 语义签名冲突自动处理 (slot_conflict 类型)
         slot_conflicts = rem_results.get("slot_conflicts_list", [])
         if slot_conflicts and not dry_run:
-            processed_conflicts = resolve_slot_conflicts(slot_conflicts, dream_run_id)
+            processed_conflicts = resolve_slot_conflicts(slot_conflicts, dream_run_id, backend=backend)
             stats["conflicts_resolved"] = len(processed_conflicts)
 
     # 6. 健康评分 (来自 Auto-Dream 5维)
@@ -591,7 +591,8 @@ def detect_slot_conflicts() -> list[dict]:
 
 
 def resolve_slot_conflicts(
-    conflicts: list[dict], dream_run_id: int, max_resolve: int = 5
+    conflicts: list[dict], dream_run_id: int, max_resolve: int = 5,
+    backend=None,
 ) -> list[dict]:
     """
     P7: 语义签名冲突自动处理
@@ -613,6 +614,10 @@ def resolve_slot_conflicts(
         return resolved
 
     log.info(f"  🔍 P7: {len(high_diff)} 个高值差冲突待处理 (限{max_resolve})")
+
+    if backend is None:
+        from dream_cycle.ops import create_backend
+        backend = create_backend(use_staging=False)
 
     for c in high_diff[:max_resolve]:
         mem1_id = c.get("mem1_id", "")
@@ -656,11 +661,21 @@ def resolve_slot_conflicts(
             log.info(
                 f"    ✅ SUPERSEDE: 归档 {older_id[:8]}, 保留 {newer_id[:8]} ({explanation[:60]})"
             )
-            # 归档旧记忆
-            safe_explanation = explanation[:100].replace('"', "").replace("'", "''")
-            pg_query(
-                f"""UPDATE mem0 SET payload = payload || '{{"archived": true, "archived_reason": "slot_supersede", "superseded_by": "{newer_id}", "supersede_explanation": "{safe_explanation}", "freshness": "outdated", "freshness_source": "dream_cycle_supersede"}}' WHERE id::text = '{older_id}'"""
-            )
+            # Archive older memory via backend
+            from dream_cycle.types import MemoryOp
+            backend.execute(MemoryOp(
+                op="archive",
+                memory_id=older_id,
+                stage="slot_conflict",
+                reason=f"Superseded by {newer_id[:8]}: {explanation[:100]}",
+                superseded_by=newer_id,
+                payload_patch={
+                    "archived_reason": "slot_supersede",
+                    "supersede_explanation": explanation[:100],
+                    "freshness": "outdated",
+                    "freshness_source": "dream_cycle_supersede",
+                },
+            ))
             mark_manifest_archived([older_id])
             resolved.append(
                 {
@@ -672,14 +687,31 @@ def resolve_slot_conflicts(
             )
 
         elif ctype == "EXTEND":
-            # 新事实扩展旧事实 → 两条都保留，标记 extended
+            # Extend: both preserved, mark relationship via backend
             log.info(f"    🔗 EXTEND: 两条都保留 ({explanation[:60]})")
-            pg_query(
-                f"""UPDATE mem0 SET payload = payload || '{{"extended": true, "extended_by": "{mem2_id}", "extension_type": "{ctype}"}}' WHERE id::text = '{mem1_id}'"""
-            )
-            pg_query(
-                f"""UPDATE mem0 SET payload = payload || '{{"extended": true, "extends": "{mem1_id}", "extension_type": "{ctype}"}}' WHERE id::text = '{mem2_id}'"""
-            )
+            from dream_cycle.types import MemoryOp
+            backend.execute(MemoryOp(
+                op="extend",
+                memory_id=mem1_id,
+                stage="slot_conflict",
+                reason=f"Extended by {mem2_id[:8]}: {explanation[:100]}",
+                payload_patch={
+                    "extended": True,
+                    "extended_by": mem2_id,
+                    "extension_type": ctype,
+                },
+            ))
+            backend.execute(MemoryOp(
+                op="extend",
+                memory_id=mem2_id,
+                stage="slot_conflict",
+                reason=f"Extends {mem1_id[:8]}: {explanation[:100]}",
+                payload_patch={
+                    "extended": True,
+                    "extends": mem1_id,
+                    "extension_type": ctype,
+                },
+            ))
             resolved.append(
                 {
                     "type": "EXTEND",
@@ -717,7 +749,7 @@ def resolve_slot_conflicts(
 # ─── 报告生成 ──────────────────────────────────────────────────────────
 
 
-def degrade_tiers(dry_run: bool = False) -> dict:
+def degrade_tiers(dry_run: bool = False, backend=None) -> dict:
     """
     Three-tier degradation for episodic memories (from Mnemosyne BEAM).
 
@@ -734,6 +766,10 @@ def degrade_tiers(dry_run: bool = False) -> dict:
 
     log.info(f"📉 Tier Degradation{' (dry-run)' if dry_run else ''}")
     stats = {"tier1_to_tier2": 0, "tier2_to_tier3": 0, "errors": 0}
+
+    if backend is None:
+        from dream_cycle.ops import create_backend
+        backend = create_backend(use_staging=False)
 
     now = datetime.now(HKT)
 
@@ -784,15 +820,20 @@ def degrade_tiers(dry_run: bool = False) -> dict:
             if last_period > TIER2_MAX_CHARS // 2:
                 summary = summary[: last_period + 1]
 
-        # Update PG: set degraded text + tier metadata
-        escaped_summary = summary.replace("'", "''").replace("\n", " ")
-        escaped_original = text.replace("'", "''").replace("\n", " ")[:500]
-        pg_query(
-            f"""UPDATE mem0 SET payload = payload
-                || '{{"dream_tier": "2", "degraded_at": "{now.isoformat()}", "pre_degradation_text": "{escaped_original}"}}'
-                || jsonb_set(payload, '{{data}}', '"{escaped_summary}"')
-            WHERE id::text = '{mid}'"""
-        )
+        # Update PG via backend: degrade text + tier metadata
+        from dream_cycle.types import MemoryOp
+        backend.execute(MemoryOp(
+            op="degrade",
+            memory_id=mid,
+            stage="tier_degradation",
+            new_text=summary,
+            reason=f"Tier 1→2: {summary[:60]}",
+            payload_patch={
+                "dream_tier": "2",
+                "degraded_at": now.isoformat(),
+                "pre_degradation_text": text[:500],
+            },
+        ))
         stats["tier1_to_tier2"] += 1
 
     # ── Tier 2 → Tier 3: Text extraction (keep key entities) ──
@@ -836,13 +877,19 @@ def degrade_tiers(dry_run: bool = False) -> dict:
 
         extracted = " ".join(key_sentences)[:TIER3_MAX_CHARS] if key_sentences else text[:TIER3_MAX_CHARS]
 
-        escaped_extracted = extracted.replace("'", "''").replace("\n", " ")
-        pg_query(
-            f"""UPDATE mem0 SET payload = payload
-                || '{{"dream_tier": "3", "degraded_at": "{now.isoformat()}"}}'
-                || jsonb_set(payload, '{{data}}', '"{escaped_extracted}"')
-            WHERE id::text = '{mid}'"""
-        )
+        # Update PG via backend: degrade text + tier metadata
+        from dream_cycle.types import MemoryOp
+        backend.execute(MemoryOp(
+            op="degrade",
+            memory_id=mid,
+            stage="tier_degradation",
+            new_text=extracted,
+            reason=f"Tier 2→3: {extracted[:60]}",
+            payload_patch={
+                "dream_tier": "3",
+                "degraded_at": now.isoformat(),
+            },
+        ))
         stats["tier2_to_tier3"] += 1
 
     log.info(

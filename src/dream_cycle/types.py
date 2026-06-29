@@ -86,7 +86,7 @@ class DreamMemory:
 
 # ─── Operation Types ─────────────────────────────────────────────────────────
 
-OpType = Literal["archive", "update_text", "delete", "boost", "extend"]
+OpType = Literal["archive", "update_text", "delete", "boost", "extend", "degrade"]
 
 
 @dataclass

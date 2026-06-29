@@ -81,11 +81,13 @@ class StagingBuffer:
         ))
 
     def add_update_text(self, memory_id: str, new_text: str,
-                        reason: str = "", stage: str = ""):
-        """Propose updating a memory's text content."""
+                        reason: str = "", stage: str = "",
+                        payload_patch: dict = None):
+        """Propose updating a memory's text content (optionally with metadata)."""
         self.proposals.append(PGProposal(
             op="update_text", memory_id=memory_id,
             new_text=new_text, reason=reason, stage=stage,
+            payload_patch=payload_patch or {},
         ))
 
     def add_archive(self, memory_id: str, reason: str = "",
