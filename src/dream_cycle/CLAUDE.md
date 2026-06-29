@@ -81,7 +81,13 @@ PG(mem0) → [Stage 1: Shallow Sleep] → [Stage 2: REM] → [Stage 3: Deep Slee
 ### 关键文件职责
 
 - **config.py** — 所有可调参数的唯一来源（阈值、权重、路径、API配置）
+- **types.py** — v7 dataclass 合约: DreamMemory, MemoryOp, PrepareResult, BudgetSummary, ExecuteResult
+- **ops.py** — v7 MemoryBackend 抽象层: DirectBackend (PG直写) + StagingBackend (缓冲) + create_backend() factory
 - **orchestrator.py** — 主循环编排 + 锁管理 + 报告生成 + 批量运维操作
+- **staging.py** — StagingBuffer + PGProposal + write_staging() + adopt() 安全合约
+- **budget.py** — EditBudget: 编辑预算(8/晚) + token预算 + 挂钟预算 + 余弦衰减
+- **split.py** — SHA256 确定性 train/val/test 分割 (70/20/10)
+- **validation.py** — Held-out 验证: 搜索质量评分 + Gate Safety Probe
 - **session.py** — 从 state.db 挖掘 session 信号(纠正/偏好/决策/模式)注入为高优先级记忆
 - **health.py** — 自适应触发判断(4条件) + 在线去冗余检查(写入时) + 健康仪表盘
 - **entities.py** — 实体提取(LLM + 规则)、停用词表、领域加权关键词
@@ -90,7 +96,7 @@ PG(mem0) → [Stage 1: Shallow Sleep] → [Stage 2: REM] → [Stage 3: Deep Slee
 ## 测试
 
 ```bash
-# 运行全部测试 (45 tests)
+# 运行全部测试 (150 tests)
 cd /root/repos/dream-cycle
 python3 -m pytest src/dream_cycle/tests/ -v
 
